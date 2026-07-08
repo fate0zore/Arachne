@@ -335,7 +335,7 @@ def _parse_args() -> argparse.Namespace:
         description="Preview detect-depth-grasp path from Gemini335 RGB-D in RViz."
     )
     hidden = argparse.SUPPRESS
-    parser.add_argument("--model", default="yolo_workspace/weights/yolo26m.onnx", help=hidden)
+    parser.add_argument("--model", default="yolo_workspace/weights/yolo26n.onnx", help=hidden)
     parser.add_argument("--venv", default="yolo_workspace/.venv", help=hidden)
     parser.add_argument("--yolo-task", default="detect", help=hidden)
     parser.add_argument("--classes", default="")
@@ -646,6 +646,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-execute-trigger-topic", default="", help=hidden)
     parser.add_argument("--real-execute-trigger-service", default="/arachne/grasp_preview/execute_real_now", help=hidden)
     parser.add_argument("--real-gripper-settle-sec", type=float, default=2.0, help=hidden)
+    parser.add_argument("--real-preopen-gripper", action=argparse.BooleanOptionalAction, default=False, help=hidden)
     parser.add_argument("--real-gripper-status-topic", default="/arachne/hardware/gripper_status", help=hidden)
     parser.add_argument(
         "--real-gripper-require-capture",
@@ -853,6 +854,10 @@ class GraspPreviewNode(Node):
         self.real_execution_requested = not str(args.real_execute_trigger_topic).strip()
         self.real_execution_lock = threading.Lock()
         self.real_execution_thread: threading.Thread | None = None
+        self.real_gripper_preopened = False
+        self.real_gripper_preopen_time = 0.0
+        self.last_restart_search_time = 0.0
+        self.last_real_execute_request_time = 0.0
         self.real_scan_thread: threading.Thread | None = None
         self._last_real_scan_warning = ""
         self._last_real_scan_warning_time = 0.0
@@ -1127,11 +1132,15 @@ class GraspPreviewNode(Node):
         return response
 
     def _request_real_execution(self) -> None:
+        now = time.monotonic()
         with self.real_execution_lock:
             if self.real_execution_requested or self.real_execution_started:
                 return
             self.real_execution_requested = True
+            self.last_real_execute_request_time = now
         self.get_logger().info("REAL execution trigger received")
+        self.get_logger().info("grasp_timing trigger accepted")
+        self._preopen_real_gripper_for_request()
         preview = self.last_preview
         if preview is not None and preview.arm_trajectory_frames:
             with self.real_execution_lock:
@@ -1162,6 +1171,7 @@ class GraspPreviewNode(Node):
         self.preview_ik_message = message
 
     def _restart_search(self, reason: str) -> None:
+        self.last_restart_search_time = time.monotonic()
         self.inference_paused = False
         self.plan_lock_time = 0.0
         self.last_preview = None
@@ -1205,6 +1215,7 @@ class GraspPreviewNode(Node):
         return True
 
     def _tick(self) -> None:
+        tick_start = time.monotonic()
         if self.latest_color is None:
             self._throttled_log("waiting for color topic")
             return
@@ -1224,12 +1235,22 @@ class GraspPreviewNode(Node):
             self._publish_locked_annotation(color, self.latest_color.header)
             return
         if self._color_frame_is_stale():
+            if self.real_execution_requested and not self.real_execution_started:
+                since_trigger = (
+                    tick_start - self.last_real_execute_request_time
+                    if self.last_real_execute_request_time > 0.0
+                    else -1.0
+                )
+                self.get_logger().info(
+                    f"grasp_timing tick_skip reason=stale since_trigger={since_trigger:.3f}s"
+                )
             return
         try:
             color = _image_to_bgr(self.latest_color)
         except ValueError as exc:
             self._throttled_log(str(exc))
             return
+        color_done = time.monotonic()
 
         model_input = self._yolo_depth_filtered_input(color)
         if model_input is None:
@@ -1247,9 +1268,12 @@ class GraspPreviewNode(Node):
             self.image_pub.publish(_image_from_bgr(annotated, self.latest_color.header))
             self._throttled_log("waiting for depth height mask before YOLO")
             return
+        filter_done = time.monotonic()
 
         result = self._predict(model_input)
+        predict_done = time.monotonic()
         detection = self._best_detection(result)
+        select_done = time.monotonic()
         annotated = color.copy()
         header = self.latest_color.header
         if detection is not None:
@@ -1273,11 +1297,27 @@ class GraspPreviewNode(Node):
                 self.snapshot_header = None
                 self._clear_markers(header)
             self._throttled_log("no target detection")
+            if self.real_execution_requested and not self.real_execution_started:
+                since_trigger = (
+                    select_done - self.last_real_execute_request_time
+                    if self.last_real_execute_request_time > 0.0
+                    else -1.0
+                )
+                self.get_logger().info(
+                    "grasp_timing detect_none "
+                    f"since_trigger={since_trigger:.3f}s "
+                    f"color={color_done - tick_start:.3f}s "
+                    f"depth_filter={filter_done - color_done:.3f}s "
+                    f"yolo={predict_done - filter_done:.3f}s "
+                    f"select={select_done - predict_done:.3f}s"
+                )
             return
 
         self.missing_frames = 0
         self._publish_detection_event(detection, header)
         needs_snapshot, reason = self._needs_depth_snapshot(detection, color.shape)
+        depth_done = select_done
+        preview_done = select_done
         if needs_snapshot:
             if self.latest_depth is None or self.depth_info is None:
                 self.depth_wait_detection = detection
@@ -1294,7 +1334,9 @@ class GraspPreviewNode(Node):
             except ValueError as exc:
                 self._throttled_log(str(exc))
                 return
+            depth_done = time.monotonic()
             preview = self._make_preview(detection, depth, reason)
+            preview_done = time.monotonic()
         elif self.last_preview is not None:
             preview = replace(self.last_preview, detection=detection, snapshot_reason="cached")
         else:
@@ -1314,6 +1356,21 @@ class GraspPreviewNode(Node):
             self.image_pub.publish(_image_from_bgr(annotated, header))
             self._clear_markers(header)
             self._throttled_log("detection found, but ROI depth is invalid")
+            if needs_snapshot:
+                since_trigger = (
+                    preview_done - self.last_real_execute_request_time
+                    if self.last_real_execute_request_time > 0.0
+                    else -1.0
+                )
+                self.get_logger().info(
+                    "grasp_timing preview_failed "
+                    f"label={detection.label} reason={reason} "
+                    f"since_trigger={since_trigger:.3f}s "
+                    f"yolo={predict_done - filter_done:.3f}s "
+                    f"select={select_done - predict_done:.3f}s "
+                    f"depth={depth_done - select_done:.3f}s "
+                    f"make_preview={preview_done - depth_done:.3f}s"
+                )
             return
 
         if needs_snapshot:
@@ -1328,9 +1385,39 @@ class GraspPreviewNode(Node):
             self.latest_depth.header if self.latest_depth is not None else header
         )
         self.last_preview = preview
+        publish_start = time.monotonic()
         self._publish_preview(preview, preview_header)
         self._publish_annotated(annotated, preview, header)
+        publish_done = time.monotonic()
         self._save_latest(annotated, color, preview)
+        save_done = time.monotonic()
+        if needs_snapshot:
+            since_restart = (
+                save_done - self.last_restart_search_time
+                if self.last_restart_search_time > 0.0
+                else -1.0
+            )
+            since_trigger = (
+                save_done - self.last_real_execute_request_time
+                if self.last_real_execute_request_time > 0.0
+                else -1.0
+            )
+            self.get_logger().info(
+                "grasp_timing preview_ready "
+                f"label={preview.detection.label} reason={reason} "
+                f"since_restart={since_restart:.3f}s "
+                f"since_trigger={since_trigger:.3f}s "
+                f"tick_total={save_done - tick_start:.3f}s "
+                f"color={color_done - tick_start:.3f}s "
+                f"depth_filter={filter_done - color_done:.3f}s "
+                f"yolo={predict_done - filter_done:.3f}s "
+                f"select={select_done - predict_done:.3f}s "
+                f"depth={depth_done - select_done:.3f}s "
+                f"make_preview={preview_done - depth_done:.3f}s "
+                f"publish={publish_done - publish_start:.3f}s "
+                f"save={save_done - publish_done:.3f}s "
+                f"roi_points={len(preview.roi_points)}"
+            )
         if needs_snapshot:
             self._start_arm_planning(preview, preview_header)
 
@@ -1588,9 +1675,11 @@ class GraspPreviewNode(Node):
             arm_frames = []
             ik_message = f"planning exception: {type(exc).__name__}: {exc}"
             self.get_logger().error(ik_message)
+        solve_done = time.monotonic()
         if self.stopping or not rclpy.ok():
             return
         planned_path = self._arm_trajectory_grasp_path_base(arm_frames) if arm_frames else []
+        path_done = time.monotonic()
         planned = replace(
             preview,
             base_path_xyz=planned_path,
@@ -1607,12 +1696,22 @@ class GraspPreviewNode(Node):
         if self.stopping or not rclpy.ok():
             return
         try:
+            publish_start = time.monotonic()
             self._publish_preview(planned, preview_header)
         except RuntimeError as exc:
             if "publisher's context is invalid" in str(exc):
                 return
             raise
-        elapsed = time.monotonic() - start
+        publish_done = time.monotonic()
+        elapsed = publish_done - start
+        self.get_logger().info(
+            "grasp_timing planning_done "
+            f"total={elapsed:.3f}s "
+            f"solve={solve_done - start:.3f}s "
+            f"path={path_done - solve_done:.3f}s "
+            f"publish={publish_done - publish_start:.3f}s "
+            f"frames={len(arm_frames)}"
+        )
         if arm_frames and "partial" not in ik_message:
             self.get_logger().info(
                 f"arm trajectory ready: frames={len(arm_frames)} "
@@ -1731,11 +1830,7 @@ class GraspPreviewNode(Node):
                 gate_owned = self._real_sdk_enter_gate()
                 self._real_sdk_exit_servo_mode(rpc)
                 self._real_sdk_stop_joint(rpc, "pre-move cleanup", warn_only=True)
-                if bool(self.args.real_execute_gripper):
-                    self._publish_real_gripper("open")
-                    settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-                    if settle > 0.0:
-                        time.sleep(settle)
+                self._open_real_gripper_before_motion()
 
                 previous_time = 0.0
                 closed = False
@@ -1960,11 +2055,7 @@ class GraspPreviewNode(Node):
             f"speed={speed:.3f}rad/s accel={accel:.3f}rad/s2"
         )
 
-        if bool(self.args.real_execute_gripper):
-            self._publish_real_gripper("open")
-            settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-            if settle > 0.0:
-                time.sleep(settle)
+        self._open_real_gripper_before_motion()
 
         previous_time = 0.0
         closed = False
@@ -2068,10 +2159,8 @@ class GraspPreviewNode(Node):
         close_index = min(max(int(close_index), 1), len(frames) - 1)
         open_index = min(max(int(open_index), close_index), len(frames) - 1)
 
-        self._publish_real_gripper("open")
         settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-        if settle > 0.0:
-            time.sleep(settle)
+        self._open_real_gripper_before_motion()
         self._send_real_follow_joint_segment(frames, 0, close_index, "to_grasp")
         self._publish_real_gripper("close")
         if settle > 0.0:
@@ -2722,7 +2811,47 @@ class GraspPreviewNode(Node):
         msg = String()
         msg.data = command
         self.real_gripper_pub.publish(msg)
+        normalized = command.strip().lower()
+        if normalized == "open":
+            self.real_gripper_preopened = True
+            self.real_gripper_preopen_time = time.monotonic()
+        elif normalized in {"close", "stop"}:
+            self.real_gripper_preopened = False
+            self.real_gripper_preopen_time = 0.0
         self.get_logger().warn(f"REAL gripper command: {command}")
+
+    def _real_preopen_gripper_enabled(self) -> bool:
+        return (
+            bool(self.args.execute_real)
+            and bool(self.args.real_execute_gripper)
+            and bool(self.args.real_preopen_gripper)
+            and str(self.args.execute_real_confirm).strip().upper() == "YES"
+        )
+
+    def _preopen_real_gripper_for_request(self) -> None:
+        if not self._real_preopen_gripper_enabled():
+            return
+        self.get_logger().info("REAL gripper preopen requested")
+        self._publish_real_gripper("open")
+
+    def _open_real_gripper_before_motion(self) -> None:
+        if not bool(self.args.real_execute_gripper):
+            return
+        settle = max(float(self.args.real_gripper_settle_sec), 0.0)
+        if self._real_preopen_gripper_enabled() and self.real_gripper_preopened:
+            elapsed = max(time.monotonic() - self.real_gripper_preopen_time, 0.0)
+            remaining = settle - elapsed
+            if remaining > 0.0:
+                self.get_logger().warn(
+                    f"REAL gripper preopen settling before arm motion: remaining={remaining:.2f}s"
+                )
+                time.sleep(remaining)
+            else:
+                self.get_logger().warn("REAL gripper preopen settled; skipping pre-motion open wait")
+            return
+        self._publish_real_gripper("open")
+        if settle > 0.0:
+            time.sleep(settle)
 
     def _latest_gripper_status(self) -> tuple[float, str] | None:
         with self.gripper_status_lock:
@@ -3071,6 +3200,7 @@ class GraspPreviewNode(Node):
     def _make_preview(
         self, detection: Detection, depth: np.ndarray, snapshot_reason: str
     ) -> GraspPreview | None:
+        start = time.monotonic()
         info = self.depth_info
         if info is None:
             return None
@@ -3083,6 +3213,7 @@ class GraspPreviewNode(Node):
         x1d, x2d = x1 * sx, x2 * sx
         y1d, y2d = y1 * sy, y2 * sy
         mask_depth = self._detection_depth_mask(detection, dw, dh, cw, ch)
+        mask_done = time.monotonic()
 
         cx = 0.5 * (x1d + x2d)
         cy = 0.5 * (y1d + y2d)
@@ -3105,17 +3236,22 @@ class GraspPreviewNode(Node):
         valid = roi[valid_mask]
         if valid.size < 8:
             return None
+        roi_done = time.monotonic()
 
         depth_m = float(np.percentile(valid, float(self.args.depth_percentile)))
-        roi_points = self._roi_points(
+        percentile_done = time.monotonic()
+        roi_points_raw = self._roi_points(
             depth, ix1, iy1, ix2, iy2, depth_m, mask_depth if mask_roi is not None else None
         )
-        roi_points = self._filter_roi_points_by_base_z(roi_points)
+        points_done = time.monotonic()
+        roi_points = self._filter_roi_points_by_base_z(roi_points_raw)
         if not roi_points:
             return None
+        filter_done = time.monotonic()
         visual_axis_camera, visual_axis_confidence = self._detection_visual_axis_camera(
             detection, depth_m, dw, dh, cw, ch
         )
+        axis_done = time.monotonic()
         arr = np.asarray(roi_points, dtype=np.float32)
         grasp_x, grasp_y, grasp_z = np.median(arr, axis=0).astype(float)
 
@@ -3134,6 +3270,7 @@ class GraspPreviewNode(Node):
             self._pixel_to_xyz(x2d, y2d, depth_m),
             self._pixel_to_xyz(x1d, y2d, depth_m),
         ]
+        camera_points_done = time.monotonic()
         (
             _base_path,
             base_segments,
@@ -3146,6 +3283,7 @@ class GraspPreviewNode(Node):
             visual_axis_camera,
             visual_axis_confidence,
         )
+        base_path_done = time.monotonic()
         if base_grasp is not None:
             min_z = float(self.args.yolo_depth_min_base_z)
             max_z = float(self.args.yolo_depth_max_base_z)
@@ -3164,6 +3302,20 @@ class GraspPreviewNode(Node):
                     f"max_z={max_z:.3f}"
                 )
                 return None
+        self.get_logger().info(
+            "grasp_timing make_preview "
+            f"label={detection.label} reason={snapshot_reason} "
+            f"total={base_path_done - start:.3f}s "
+            f"mask={mask_done - start:.3f}s "
+            f"roi_depth={roi_done - mask_done:.3f}s "
+            f"percentile={percentile_done - roi_done:.3f}s "
+            f"roi_points={points_done - percentile_done:.3f}s "
+            f"base_z_filter={filter_done - points_done:.3f}s "
+            f"visual_axis={axis_done - filter_done:.3f}s "
+            f"camera_waypoints={camera_points_done - axis_done:.3f}s "
+            f"base_path={base_path_done - camera_points_done:.3f}s "
+            f"roi_raw={len(roi_points_raw)} roi_filtered={len(roi_points)}"
+        )
         return GraspPreview(
             detection=detection,
             depth_m=depth_m,
@@ -5299,6 +5451,7 @@ class GraspPreviewNode(Node):
         tuple[float, float, float] | None,
         PointCloudGraspShape | None,
     ]:
+        start = time.monotonic()
         if self.latest_depth is None:
             return [], [], [], None, None
         depth_header = self.latest_depth.header
@@ -5310,17 +5463,20 @@ class GraspPreviewNode(Node):
             return [], [], [], None, None
         if transform is None:
             return [], [], [], None, None
+        tf_done = time.monotonic()
 
         base_grasp_path = [
             self._apply_grasp_base_offset(self._transform_point(transform, point))
             for point in camera_path
         ]
+        transform_done = time.monotonic()
         pointcloud_shape = self._estimate_pointcloud_grasp_shape_base(
             roi_points,
             transform,
             visual_axis_camera,
             visual_axis_confidence,
         )
+        shape_done = time.monotonic()
         if pointcloud_shape is not None and pointcloud_shape.z_bias_m > 1e-6:
             base_grasp_path = self._apply_visible_upper_half_bias(
                 base_grasp_path, pointcloud_shape.z_bias_m
@@ -5394,6 +5550,7 @@ class GraspPreviewNode(Node):
             ("drop", self.basket_release_base),
             ("observe_start", observe_base),
         ]
+        waypoint_done = time.monotonic()
         raw_segments = [
             CartesianSegment(
                 "quadratic",
@@ -5424,7 +5581,20 @@ class GraspPreviewNode(Node):
             ),
         ]
         segments = self._time_parameterize_segments(raw_segments)
+        segment_done = time.monotonic()
         path = self._sample_trajectory_for_display(segments)
+        sample_done = time.monotonic()
+        self.get_logger().info(
+            "grasp_timing base_path "
+            f"total={sample_done - start:.3f}s "
+            f"tf={tf_done - start:.3f}s "
+            f"camera_to_base={transform_done - tf_done:.3f}s "
+            f"shape={shape_done - transform_done:.3f}s "
+            f"waypoints={waypoint_done - shape_done:.3f}s "
+            f"segments={segment_done - waypoint_done:.3f}s "
+            f"sample={sample_done - segment_done:.3f}s "
+            f"path_points={len(path)}"
+        )
         return path, segments, waypoints, grasp_base, pointcloud_shape
 
     def _estimate_pointcloud_grasp_shape_base(

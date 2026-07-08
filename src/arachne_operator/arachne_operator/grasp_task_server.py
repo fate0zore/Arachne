@@ -128,6 +128,8 @@ class GraspTaskServer(Node):
         self.declare_parameter("release_point_b_joints", DEFAULT_RELEASE_POINT_B_JOINTS)
         self.declare_parameter("real_sdk_move_speed", 0.18)
         self.declare_parameter("real_sdk_move_accel", 0.25)
+        self.declare_parameter("real_gripper_settle_sec", 2.0)
+        self.declare_parameter("real_preopen_gripper", False)
         self.declare_parameter("real_sdk_ip", os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"))
         self.declare_parameter("real_sdk_rpc_port", 30004)
         self.declare_parameter("real_sdk_rpc_timeout", 2.0)
@@ -207,6 +209,7 @@ class GraspTaskServer(Node):
         self.idle_preview_log_file = None
         self.idle_preview_reader: threading.Thread | None = None
         self.idle_preview_last_start = 0.0
+        self.idle_preview_config_key = ""
         self.worker: threading.Thread | None = None
         self.base_worker: threading.Thread | None = None
         self.runner_success_requested = False
@@ -425,11 +428,27 @@ class GraspTaskServer(Node):
         with self.lock:
             process = self.idle_preview_process
             last_start = self.idle_preview_last_start
+            config_key = self.idle_preview_config_key
         if process is not None and process.poll() is None:
-            return
+            if config_key != self._idle_preview_config_key():
+                self._stop_idle_preview("preview config changed")
+                with self.lock:
+                    self.idle_preview_last_start = 0.0
+            else:
+                return
+        with self.lock:
+            last_start = self.idle_preview_last_start
         if time.monotonic() - last_start < 10.0:
             return
         self._start_idle_preview()
+
+    def _idle_preview_config_key(self) -> str:
+        return "|".join(
+            (
+                str(self.get_parameter("real_gripper_settle_sec").value),
+                str(bool(self.get_parameter("real_preopen_gripper").value)),
+            )
+        )
 
     def _start_idle_preview(self) -> None:
         with self.lock:
@@ -462,6 +481,7 @@ class GraspTaskServer(Node):
         with self.lock:
             self.idle_preview_process = process
             self.idle_preview_last_start = time.monotonic()
+            self.idle_preview_config_key = self._idle_preview_config_key()
             self.idle_preview_reader = threading.Thread(
                 target=self._idle_preview_reader_loop,
                 args=(process, log_path),
@@ -546,6 +566,12 @@ class GraspTaskServer(Node):
         env["ARACHNE_GRASP_REAL_SDK_MOVE_ACCEL"] = str(
             self.get_parameter("real_sdk_move_accel").value
         )
+        env["ARACHNE_GRASP_REAL_GRIPPER_SETTLE_SEC"] = str(
+            self.get_parameter("real_gripper_settle_sec").value
+        )
+        env["ARACHNE_GRASP_REAL_PREOPEN_GRIPPER"] = (
+            "true" if bool(self.get_parameter("real_preopen_gripper").value) else "false"
+        )
         env["ARACHNE_GRASP_REAL_SDK_TEACH_FLAG_PATH"] = str(
             self.get_parameter("aubo_teach_flag_path").value
         )
@@ -587,6 +613,7 @@ class GraspTaskServer(Node):
             log_file = self.idle_preview_log_file
             self.idle_preview_process = None
             self.idle_preview_log_file = None
+            self.idle_preview_config_key = ""
         if process is not None and process.poll() is None:
             self._event("idle_preview_stop", {"reason": reason, "pid": process.pid})
             self._terminate_process_group(process, reason, timeout=2.0)
@@ -1893,6 +1920,12 @@ class GraspTaskServer(Node):
         env["ARACHNE_GRASP_REAL_SDK_MOVE_ACCEL"] = str(
             self.get_parameter("real_sdk_move_accel").value
         )
+        env["ARACHNE_GRASP_REAL_GRIPPER_SETTLE_SEC"] = str(
+            self.get_parameter("real_gripper_settle_sec").value
+        )
+        env["ARACHNE_GRASP_REAL_PREOPEN_GRIPPER"] = (
+            "true" if bool(self.get_parameter("real_preopen_gripper").value) else "false"
+        )
         env["ARACHNE_GRASP_REAL_SDK_TEACH_FLAG_PATH"] = str(
             self.get_parameter("aubo_teach_flag_path").value
         )
@@ -1998,6 +2031,8 @@ class GraspTaskServer(Node):
             env["ARACHNE_GRASP_REAL_SDK_MOVE_SPEED"],
             "--real-sdk-move-accel",
             env["ARACHNE_GRASP_REAL_SDK_MOVE_ACCEL"],
+            "--real-gripper-settle-sec",
+            env["ARACHNE_GRASP_REAL_GRIPPER_SETTLE_SEC"],
             "--real-sdk-teach-flag-path",
             env["ARACHNE_GRASP_REAL_SDK_TEACH_FLAG_PATH"],
             "--real-sdk-control-owner-path",
@@ -2009,6 +2044,11 @@ class GraspTaskServer(Node):
             "--aubo-move-joint-wait-server-sec",
             env["ARACHNE_GRASP_AUBO_MOVE_JOINT_WAIT_SERVER_SEC"],
         ]
+        command.append(
+            "--real-preopen-gripper"
+            if env["ARACHNE_GRASP_REAL_PREOPEN_GRIPPER"] == "true"
+            else "--no-real-preopen-gripper"
+        )
         if execute_real:
             command.append("--execute-real")
         if env.get("ARACHNE_CONFIRM_GRASP_EXECUTE_REAL") == "YES":
@@ -2050,13 +2090,15 @@ class GraspTaskServer(Node):
         if configured:
             return configured
         for rel in (
+            "yolo_workspace/weights/yolo26n.onnx",
+            "yolo_workspace/weights/yolo26n.pt",
             "yolo_workspace/weights/yolo26m.onnx",
             "yolo_workspace/weights/yolo26m.pt",
         ):
             path = self.root / rel
             if path.exists():
                 return str(path)
-        return str(self.root / "yolo_workspace/weights/yolo26m.onnx")
+        return str(self.root / "yolo_workspace/weights/yolo26n.onnx")
 
     def _log_root(self) -> Path:
         configured = Path(str(self.get_parameter("log_root").value)).expanduser()
@@ -2083,6 +2125,8 @@ class GraspTaskServer(Node):
             "release_point_b_joints",
             "real_sdk_move_speed",
             "real_sdk_move_accel",
+            "real_gripper_settle_sec",
+            "real_preopen_gripper",
             "aubo_teach_flag_path",
             "aubo_control_owner_path",
             "aubo_control_owner_name",

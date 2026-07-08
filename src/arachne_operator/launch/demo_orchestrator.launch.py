@@ -74,6 +74,8 @@ def generate_launch_description():
                     "real_fixed_post_grasp:=true "
                     "real_fixed_search_joints:=-1.629044,0.031622,1.684745,0.079056,1.575197,0.754000 "
                     "real_sdk_move_speed:=0.36 real_sdk_move_accel:=0.60 "
+                    "real_gripper_settle_sec:=2.0 "
+                    "real_preopen_gripper:=true "
                     "aubo_move_joint_fallback_internal:=false "
                     "extra_args:='--planner-backend local --imgsz 640 --min-detection-mask-area-px 0 "
                     "--reject-label-keywords= --planning-key-waypoints approach,grasp "

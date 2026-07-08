@@ -92,6 +92,17 @@ MANAGED_SERVICE_READY_TOPICS = {
 }
 
 
+def _upsert_launch_arg(command: str, key: str, value: str) -> str:
+    token = f"{key}:="
+    parts = shlex.split(command)
+    for index, part in enumerate(parts):
+        if part.startswith(token):
+            parts[index] = f"{token}{value}"
+            return shlex.join(parts)
+    parts.append(f"{token}{value}")
+    return shlex.join(parts)
+
+
 class AuboDirectJsonRpc:
     def __init__(self, ip: str, port: int, timeout: float) -> None:
         self.ip = ip
@@ -437,6 +448,8 @@ class TeachPanelNode(Node):
                 "real_fixed_search_joints:=-1.611779,-0.457910,1.071527,-0.044520,1.575231,0.771459 "
                 "real_sdk_move_speed:=0.18 "
                 "real_sdk_move_accel:=0.25 "
+                "real_gripper_settle_sec:=2.0 "
+                "real_preopen_gripper:=true "
                 "prefer_aubo_move_joint_action:=false "
                 "aubo_move_joint_fallback_internal:=false "
                 "extra_args:='--planner-backend local --imgsz 640 --inference-period 0.5 --min-detection-mask-area-px 0 "
@@ -3668,6 +3681,12 @@ class TeachPanelNode(Node):
     def _start_managed_process_worker(self, name: str) -> None:
         command_param = MANAGED_SERVICE_COMMAND_PARAMS[name]
         command = str(self.get_parameter(command_param).value).strip()
+        if name == "grasp_server" and command:
+            command = _upsert_launch_arg(
+                command,
+                "real_gripper_settle_sec",
+                f"{float(self.get_parameter('gripper_settle_sec').value):.3f}",
+            )
         if not command:
             self._status(f"service {name} has empty command", warn=True)
             return
@@ -3978,6 +3997,7 @@ class TeachPanelNode(Node):
                 ),
             ]
         )
+        self._set_grasp_task_real_gripper_settle(float(gripper_settle_sec))
         self._status(
             "motion settings applied: "
             f"base={base_linear_speed:.3f}m/s {base_angular_speed:.3f}rad/s, "
@@ -3986,6 +4006,32 @@ class TeachPanelNode(Node):
             f"accel={arm_accel_rad_sec2:.2f}rad/s2, hold={arm_hold_period_sec:.2f}s, "
             f"gripper_settle={gripper_settle_sec:.1f}s"
         )
+
+    def _set_grasp_task_real_gripper_settle(self, settle_sec: float) -> bool:
+        client = self.grasp_task_parameter_client
+        if not client.wait_for_service(timeout_sec=0.05):
+            return False
+        request = SetParameters.Request()
+        request.parameters = [
+            RosParameter(
+                name="real_gripper_settle_sec",
+                value=ParameterValue(
+                    type=ParameterType.PARAMETER_DOUBLE,
+                    double_value=float(settle_sec),
+                ),
+            )
+        ]
+        future = client.call_async(request)
+        if not self._wait_service_future(future, 1.0):
+            self._status("grasp gripper settle update timeout", warn=True)
+            return False
+        response = future.result()
+        results = response.results if response is not None else []
+        if not results or not bool(results[0].successful):
+            reason = results[0].reason if results else "empty response"
+            self._status(f"grasp gripper settle rejected: {reason}", warn=True)
+            return False
+        return True
 
     def _status(self, text: str, *, warn: bool = False) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -5150,6 +5196,9 @@ class TeachPanelApp:
             loaded = self.node.load_teach_config(self.config_path_var.get())
             if loaded:
                 self._sync_config_vars_from_node()
+                self.node._set_grasp_task_real_gripper_settle(
+                    float(self.node.get_parameter("gripper_settle_sec").value)
+                )
         except Exception as exc:
             messagebox.showerror("Load Config", str(exc))
 
