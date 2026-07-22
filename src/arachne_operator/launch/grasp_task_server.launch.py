@@ -42,6 +42,8 @@ def generate_launch_description():
             DeclareLaunchArgument("real_sdk_move_accel", default_value="0.25"),
             DeclareLaunchArgument("real_gripper_settle_sec", default_value="2.0"),
             DeclareLaunchArgument("real_preopen_gripper", default_value="false"),
+            DeclareLaunchArgument("real_sdk_prewarm", default_value="true"),
+            DeclareLaunchArgument("real_sdk_prewarm_wait_sec", default_value="0.25"),
             DeclareLaunchArgument(
                 "aubo_teach_flag_path",
                 default_value="/tmp/arachne_aubo_teach_mode",
@@ -163,6 +165,12 @@ def generate_launch_description():
                         ),
                         "real_preopen_gripper": ParameterValue(
                             LaunchConfiguration("real_preopen_gripper"), value_type=bool
+                        ),
+                        "real_sdk_prewarm": ParameterValue(
+                            LaunchConfiguration("real_sdk_prewarm"), value_type=bool
+                        ),
+                        "real_sdk_prewarm_wait_sec": ParameterValue(
+                            LaunchConfiguration("real_sdk_prewarm_wait_sec"), value_type=float
                         ),
                         "aubo_teach_flag_path": LaunchConfiguration("aubo_teach_flag_path"),
                         "aubo_control_owner_path": LaunchConfiguration("aubo_control_owner_path"),

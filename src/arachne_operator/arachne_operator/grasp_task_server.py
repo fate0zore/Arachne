@@ -133,6 +133,8 @@ class GraspTaskServer(Node):
         self.declare_parameter("real_sdk_ip", os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"))
         self.declare_parameter("real_sdk_rpc_port", 30004)
         self.declare_parameter("real_sdk_rpc_timeout", 2.0)
+        self.declare_parameter("real_sdk_prewarm", True)
+        self.declare_parameter("real_sdk_prewarm_wait_sec", 0.25)
         self.declare_parameter("aubo_teach_flag_path", DEFAULT_AUBO_TEACH_FLAG_PATH)
         self.declare_parameter("aubo_control_owner_path", DEFAULT_AUBO_CONTROL_OWNER_PATH)
         self.declare_parameter("aubo_control_owner_name", "grasp_task_server")
@@ -447,6 +449,8 @@ class GraspTaskServer(Node):
             (
                 str(self.get_parameter("real_gripper_settle_sec").value),
                 str(bool(self.get_parameter("real_preopen_gripper").value)),
+                str(bool(self.get_parameter("real_sdk_prewarm").value)),
+                str(self.get_parameter("real_sdk_prewarm_wait_sec").value),
             )
         )
 
@@ -538,6 +542,12 @@ class GraspTaskServer(Node):
         )
         env["ARACHNE_GRASP_REAL_SEARCH_SCAN"] = "false"
         env["ARACHNE_GRASP_REAL_SDK_IP"] = str(self.get_parameter("real_sdk_ip").value)
+        env["ARACHNE_GRASP_REAL_SDK_PREWARM"] = (
+            "true" if bool(self.get_parameter("real_sdk_prewarm").value) else "false"
+        )
+        env["ARACHNE_GRASP_REAL_SDK_PREWARM_WAIT_SEC"] = str(
+            self.get_parameter("real_sdk_prewarm_wait_sec").value
+        )
         env["ARACHNE_GRASP_REAL_RETURN_HOME"] = (
             "true" if bool(self.get_parameter("real_return_home").value) else "false"
         )
@@ -1892,6 +1902,12 @@ class GraspTaskServer(Node):
             self.get_parameter("real_execute_backend").value
         )
         env["ARACHNE_GRASP_REAL_SDK_IP"] = str(self.get_parameter("real_sdk_ip").value)
+        env["ARACHNE_GRASP_REAL_SDK_PREWARM"] = (
+            "true" if bool(self.get_parameter("real_sdk_prewarm").value) else "false"
+        )
+        env["ARACHNE_GRASP_REAL_SDK_PREWARM_WAIT_SEC"] = str(
+            self.get_parameter("real_sdk_prewarm_wait_sec").value
+        )
         env["ARACHNE_GRASP_REAL_RETURN_HOME"] = (
             "true" if bool(self.get_parameter("real_return_home").value) else "false"
         )
@@ -2027,6 +2043,8 @@ class GraspTaskServer(Node):
             env["ARACHNE_GRASP_REAL_EXECUTE_BACKEND"],
             "--real-sdk-ip",
             env["ARACHNE_GRASP_REAL_SDK_IP"],
+            "--real-sdk-prewarm-wait-sec",
+            env["ARACHNE_GRASP_REAL_SDK_PREWARM_WAIT_SEC"],
             "--real-sdk-move-speed",
             env["ARACHNE_GRASP_REAL_SDK_MOVE_SPEED"],
             "--real-sdk-move-accel",
@@ -2048,6 +2066,11 @@ class GraspTaskServer(Node):
             "--real-preopen-gripper"
             if env["ARACHNE_GRASP_REAL_PREOPEN_GRIPPER"] == "true"
             else "--no-real-preopen-gripper"
+        )
+        command.append(
+            "--real-sdk-prewarm"
+            if env["ARACHNE_GRASP_REAL_SDK_PREWARM"] == "true"
+            else "--no-real-sdk-prewarm"
         )
         if execute_real:
             command.append("--execute-real")
@@ -2127,6 +2150,8 @@ class GraspTaskServer(Node):
             "real_sdk_move_accel",
             "real_gripper_settle_sec",
             "real_preopen_gripper",
+            "real_sdk_prewarm",
+            "real_sdk_prewarm_wait_sec",
             "aubo_teach_flag_path",
             "aubo_control_owner_path",
             "aubo_control_owner_name",

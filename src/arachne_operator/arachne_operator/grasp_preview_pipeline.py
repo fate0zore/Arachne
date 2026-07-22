@@ -296,6 +296,18 @@ class GraspPreview:
     ik_message: str
 
 
+@dataclass
+class RealSdkWarmSession:
+    generation: int
+    rpc: AuboDirectJsonRpc
+    owner_owned: bool
+    gate_owned: bool
+    started_at: float
+    ready_at: float
+    ip: str
+    port: int
+
+
 def _add_venv_site_packages(venv: Path) -> None:
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     candidates = [
@@ -558,6 +570,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-sdk-ip", default=os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"), help=hidden)
     parser.add_argument("--real-sdk-rpc-port", type=int, default=30004, help=hidden)
     parser.add_argument("--real-sdk-rpc-timeout", type=float, default=2.0, help=hidden)
+    parser.add_argument("--real-sdk-prewarm", action=argparse.BooleanOptionalAction, default=True, help=hidden)
+    parser.add_argument("--real-sdk-prewarm-wait-sec", type=float, default=0.25, help=hidden)
     parser.add_argument("--real-sdk-teach-flag-path", default=DEFAULT_AUBO_TEACH_FLAG_PATH, help=hidden)
     parser.add_argument(
         "--real-sdk-control-owner-path",
@@ -854,6 +868,10 @@ class GraspPreviewNode(Node):
         self.real_execution_requested = not str(args.real_execute_trigger_topic).strip()
         self.real_execution_lock = threading.Lock()
         self.real_execution_thread: threading.Thread | None = None
+        self.real_sdk_warm_lock = threading.Lock()
+        self.real_sdk_warm_generation = 0
+        self.real_sdk_warm_session: RealSdkWarmSession | None = None
+        self.real_sdk_warm_thread: threading.Thread | None = None
         self.real_gripper_preopened = False
         self.real_gripper_preopen_time = 0.0
         self.last_restart_search_time = 0.0
@@ -884,6 +902,7 @@ class GraspPreviewNode(Node):
         self.planning_thread: threading.Thread | None = None
         self.planning_generation = 0
         self.planning_lock = threading.Lock()
+        self.preview_output_lock = threading.Lock()
         self.stopping = False
         self.plan_lock_time = 0.0
         self.tool_to_grasp_matrix: np.ndarray | None = None
@@ -1141,6 +1160,7 @@ class GraspPreviewNode(Node):
         self.get_logger().info("REAL execution trigger received")
         self.get_logger().info("grasp_timing trigger accepted")
         self._preopen_real_gripper_for_request()
+        self._start_real_sdk_prewarm_for_request()
         preview = self.last_preview
         if preview is not None and preview.arm_trajectory_frames:
             with self.real_execution_lock:
@@ -1385,20 +1405,20 @@ class GraspPreviewNode(Node):
             self.latest_depth.header if self.latest_depth is not None else header
         )
         self.last_preview = preview
-        publish_start = time.monotonic()
-        self._publish_preview(preview, preview_header)
-        self._publish_annotated(annotated, preview, header)
-        publish_done = time.monotonic()
-        self._save_latest(annotated, color, preview)
-        save_done = time.monotonic()
         if needs_snapshot:
+            plan_dispatch_start = time.monotonic()
+            self._start_arm_planning(preview, preview_header)
+            plan_dispatch_done = time.monotonic()
+            output_queue_start = time.monotonic()
+            self._publish_and_save_preview_async(preview, preview_header, annotated, color, header)
+            output_queue_done = time.monotonic()
             since_restart = (
-                save_done - self.last_restart_search_time
+                plan_dispatch_done - self.last_restart_search_time
                 if self.last_restart_search_time > 0.0
                 else -1.0
             )
             since_trigger = (
-                save_done - self.last_real_execute_request_time
+                plan_dispatch_done - self.last_real_execute_request_time
                 if self.last_real_execute_request_time > 0.0
                 else -1.0
             )
@@ -1407,19 +1427,22 @@ class GraspPreviewNode(Node):
                 f"label={preview.detection.label} reason={reason} "
                 f"since_restart={since_restart:.3f}s "
                 f"since_trigger={since_trigger:.3f}s "
-                f"tick_total={save_done - tick_start:.3f}s "
+                f"tick_total={plan_dispatch_done - tick_start:.3f}s "
                 f"color={color_done - tick_start:.3f}s "
                 f"depth_filter={filter_done - color_done:.3f}s "
                 f"yolo={predict_done - filter_done:.3f}s "
                 f"select={select_done - predict_done:.3f}s "
                 f"depth={depth_done - select_done:.3f}s "
                 f"make_preview={preview_done - depth_done:.3f}s "
-                f"publish={publish_done - publish_start:.3f}s "
-                f"save={save_done - publish_done:.3f}s "
+                f"planning_dispatch={plan_dispatch_done - plan_dispatch_start:.3f}s "
+                f"output_queue={output_queue_done - output_queue_start:.3f}s "
+                "publish=async save=async "
                 f"roi_points={len(preview.roi_points)}"
             )
-        if needs_snapshot:
-            self._start_arm_planning(preview, preview_header)
+        else:
+            self._publish_preview(preview, preview_header)
+            self._publish_annotated(annotated, preview, header)
+            self._save_latest(annotated, color, preview)
 
     def _yolo_depth_filtered_input(self, color: np.ndarray) -> np.ndarray | None:
         if not bool(self.args.yolo_depth_filter):
@@ -1576,10 +1599,8 @@ class GraspPreviewNode(Node):
         self.last_preview = preview
         annotated = color.copy()
         self._draw_detection_overlay(annotated, detection, "LOCKED")
-        self._publish_preview(preview, preview_header)
-        self._publish_annotated(annotated, preview, header)
-        self._save_latest(annotated, color, preview)
         self._start_arm_planning(preview, preview_header)
+        self._publish_and_save_preview_async(preview, preview_header, annotated, color, header)
 
     def _draw_detection_overlay(
         self, image: np.ndarray, detection: Detection, prefix: str, footer: str | None = None
@@ -1663,7 +1684,7 @@ class GraspPreviewNode(Node):
                 daemon=True,
             )
             self.planning_thread.start()
-        self.get_logger().info("3D snapshot published; arm trajectory planning started")
+        self.get_logger().info("3D snapshot ready; arm trajectory planning started")
 
     def _arm_planning_worker(
         self, generation: int, preview: GraspPreview, preview_header: Header
@@ -1695,21 +1716,15 @@ class GraspPreviewNode(Node):
                 self.plan_lock_time = time.monotonic()
         if self.stopping or not rclpy.ok():
             return
-        try:
-            publish_start = time.monotonic()
-            self._publish_preview(planned, preview_header)
-        except RuntimeError as exc:
-            if "publisher's context is invalid" in str(exc):
-                return
-            raise
-        publish_done = time.monotonic()
-        elapsed = publish_done - start
+        ready_done = time.monotonic()
+        self._publish_preview_async(planned, preview_header, label="planned")
+        elapsed = ready_done - start
         self.get_logger().info(
             "grasp_timing planning_done "
             f"total={elapsed:.3f}s "
             f"solve={solve_done - start:.3f}s "
             f"path={path_done - solve_done:.3f}s "
-            f"publish={publish_done - publish_start:.3f}s "
+            "publish=async "
             f"frames={len(arm_frames)}"
         )
         if arm_frames and "partial" not in ik_message:
@@ -1726,15 +1741,21 @@ class GraspPreviewNode(Node):
             )
             self._maybe_execute_real_trajectory(planned)
         else:
+            self._discard_real_sdk_warm_session("planning unavailable", stop_joint=True)
             self.get_logger().warn(f"arm trajectory unavailable after {elapsed:.2f}s: {ik_message}")
 
     def stop(self) -> None:
         self.stopping = True
+        self._discard_real_sdk_warm_session("node stop", stop_joint=True)
         with self.planning_lock:
             self.planning_generation += 1
             thread = self.planning_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.3)
+        with self.real_sdk_warm_lock:
+            sdk_thread = self.real_sdk_warm_thread
+        if sdk_thread is not None and sdk_thread.is_alive():
+            sdk_thread.join(timeout=0.3)
 
     def _maybe_execute_real_trajectory(self, preview: GraspPreview) -> None:
         if not bool(self.args.execute_real):
@@ -1751,7 +1772,10 @@ class GraspPreviewNode(Node):
         try:
             self._execute_real_trajectory(preview)
         except Exception as exc:
+            self._discard_real_sdk_warm_session("real execution blocked", stop_joint=True)
             self.get_logger().error(f"real execution blocked: {exc}")
+        finally:
+            self._discard_real_sdk_warm_session("real execution finished", stop_joint=True)
 
     def _execute_real_trajectory(self, preview: GraspPreview) -> None:
         if not preview.arm_trajectory_frames:
@@ -1780,6 +1804,220 @@ class GraspPreviewNode(Node):
             self._execute_real_follow_joint_trajectory(preview)
             return
         raise RuntimeError(f"unsupported real execution backend: {backend}")
+
+    def _real_trigger_elapsed(self) -> float:
+        if self.last_real_execute_request_time <= 0.0:
+            return 0.0
+        return max(time.monotonic() - self.last_real_execute_request_time, 0.0)
+
+    def _real_sdk_prewarm_enabled(self) -> bool:
+        return (
+            bool(self.args.execute_real)
+            and bool(self.args.real_sdk_prewarm)
+            and str(self.args.real_execute_backend) == "sdk_move_joint"
+            and not bool(self.args.prefer_aubo_move_joint_action)
+            and str(self.args.execute_real_confirm).strip().upper() == "YES"
+        )
+
+    def _start_real_sdk_prewarm_for_request(self) -> None:
+        if not self._real_sdk_prewarm_enabled() or self.stopping:
+            return
+        ip = str(self.args.real_sdk_ip)
+        port = int(self.args.real_sdk_rpc_port)
+        timeout = max(float(self.args.real_sdk_rpc_timeout), 0.1)
+        with self.real_sdk_warm_lock:
+            if self.real_sdk_warm_session is not None:
+                return
+            thread = self.real_sdk_warm_thread
+            if thread is not None and thread.is_alive():
+                return
+            self.real_sdk_warm_generation += 1
+            generation = self.real_sdk_warm_generation
+            thread = threading.Thread(
+                target=self._real_sdk_prewarm_worker,
+                args=(generation, ip, port, timeout),
+                daemon=True,
+            )
+            self.real_sdk_warm_thread = thread
+        self.get_logger().info(
+            "grasp_timing sdk_prewarm_start "
+            f"since_trigger={self._real_trigger_elapsed():.3f}s rpc={ip}:{port}"
+        )
+        thread.start()
+
+    def _real_sdk_prewarm_is_current(self, generation: int) -> bool:
+        with self.real_sdk_warm_lock:
+            return (
+                generation == self.real_sdk_warm_generation
+                and not self.stopping
+                and rclpy.ok()
+            )
+
+    def _real_sdk_prewarm_worker(
+        self, generation: int, ip: str, port: int, timeout: float
+    ) -> None:
+        start = time.monotonic()
+        rpc: AuboDirectJsonRpc | None = None
+        owner_owned = False
+        gate_owned = False
+        try:
+            rpc = AuboDirectJsonRpc(ip, port, timeout)
+            rpc.connect()
+            connect_done = time.monotonic()
+            self.get_logger().info(f"Aubo SDK prewarm connect ok: robot={rpc.robot_name} rpc={ip}:{port}")
+            if not self._real_sdk_prewarm_is_current(generation):
+                self._close_real_sdk_handles(rpc, owner_owned, gate_owned, "stale prewarm", stop_joint=False)
+                return
+            self._real_sdk_require_running(rpc)
+            mode_done = time.monotonic()
+            if not self._real_sdk_prewarm_is_current(generation):
+                self._close_real_sdk_handles(rpc, owner_owned, gate_owned, "stale prewarm", stop_joint=False)
+                return
+            owner_owned = self._real_sdk_enter_control_owner()
+            owner_done = time.monotonic()
+            if not self._real_sdk_prewarm_is_current(generation):
+                self._close_real_sdk_handles(rpc, owner_owned, gate_owned, "stale prewarm", stop_joint=False)
+                return
+            gate_owned = self._real_sdk_enter_gate()
+            gate_done = time.monotonic()
+            if not self._real_sdk_prewarm_is_current(generation):
+                self._close_real_sdk_handles(rpc, owner_owned, gate_owned, "stale prewarm", stop_joint=True)
+                return
+            self._real_sdk_exit_servo_mode(rpc)
+            servo_done = time.monotonic()
+            self._real_sdk_stop_joint(rpc, "prewarm cleanup", warn_only=True)
+            ready_done = time.monotonic()
+            session = RealSdkWarmSession(
+                generation=generation,
+                rpc=rpc,
+                owner_owned=owner_owned,
+                gate_owned=gate_owned,
+                started_at=start,
+                ready_at=ready_done,
+                ip=ip,
+                port=port,
+            )
+            with self.real_sdk_warm_lock:
+                if (
+                    generation == self.real_sdk_warm_generation
+                    and self.real_sdk_warm_session is None
+                    and not self.stopping
+                    and rclpy.ok()
+                ):
+                    self.real_sdk_warm_session = session
+                    rpc = None
+                else:
+                    session = None  # type: ignore[assignment]
+            if session is None:
+                self._close_real_sdk_handles(
+                    rpc, owner_owned, gate_owned, "stale prewarm", stop_joint=True
+                )
+                return
+            self.get_logger().info(
+                "grasp_timing sdk_prewarm_ready "
+                f"total={ready_done - start:.3f}s "
+                f"since_trigger={self._real_trigger_elapsed():.3f}s "
+                f"connect={connect_done - start:.3f}s "
+                f"mode={mode_done - connect_done:.3f}s "
+                f"owner={owner_done - mode_done:.3f}s "
+                f"gate={gate_done - owner_done:.3f}s "
+                f"servo={servo_done - gate_done:.3f}s "
+                f"stop={ready_done - servo_done:.3f}s"
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            if rpc is not None:
+                self._close_real_sdk_handles(
+                    rpc, owner_owned, gate_owned, "failed prewarm", stop_joint=gate_owned
+                )
+            self.get_logger().warn(
+                "grasp_timing sdk_prewarm_failed "
+                f"total={elapsed:.3f}s since_trigger={self._real_trigger_elapsed():.3f}s "
+                f"error={exc}"
+            )
+
+    def _take_real_sdk_warm_session(self) -> RealSdkWarmSession | None:
+        if not self._real_sdk_prewarm_enabled():
+            return None
+        start = time.monotonic()
+        wait_sec = max(float(self.args.real_sdk_prewarm_wait_sec), 0.0)
+        deadline = start + wait_sec
+        thread_alive = False
+        while rclpy.ok() and not self.stopping:
+            with self.real_sdk_warm_lock:
+                session = self.real_sdk_warm_session
+                if session is not None:
+                    self.real_sdk_warm_session = None
+                    waited = time.monotonic() - start
+                    self.get_logger().info(
+                        "grasp_timing sdk_prewarm_take "
+                        f"wait={waited:.3f}s "
+                        f"age={time.monotonic() - session.ready_at:.3f}s "
+                        f"since_trigger={self._real_trigger_elapsed():.3f}s "
+                        f"generation={session.generation}"
+                    )
+                    return session
+                thread = self.real_sdk_warm_thread
+                thread_alive = thread is not None and thread.is_alive()
+            if time.monotonic() >= deadline or not thread_alive:
+                break
+            time.sleep(0.01)
+        waited = time.monotonic() - start
+        if thread_alive:
+            with self.real_sdk_warm_lock:
+                self.real_sdk_warm_generation += 1
+        self.get_logger().info(
+            "grasp_timing sdk_prewarm_miss "
+            f"wait={waited:.3f}s thread_alive={thread_alive} "
+            f"since_trigger={self._real_trigger_elapsed():.3f}s"
+        )
+        return None
+
+    def _discard_real_sdk_warm_session(self, reason: str, *, stop_joint: bool) -> None:
+        with self.real_sdk_warm_lock:
+            self.real_sdk_warm_generation += 1
+            session = self.real_sdk_warm_session
+            self.real_sdk_warm_session = None
+        if session is None:
+            return
+        self.get_logger().info(
+            "grasp_timing sdk_prewarm_discard "
+            f"reason={reason} age={time.monotonic() - session.ready_at:.3f}s"
+        )
+        self._close_real_sdk_warm_session(session, reason, stop_joint=stop_joint)
+
+    def _close_real_sdk_warm_session(
+        self, session: RealSdkWarmSession, reason: str, *, stop_joint: bool
+    ) -> None:
+        self._close_real_sdk_handles(
+            session.rpc,
+            session.owner_owned,
+            session.gate_owned,
+            reason,
+            stop_joint=stop_joint,
+        )
+
+    def _close_real_sdk_handles(
+        self,
+        rpc: AuboDirectJsonRpc | None,
+        owner_owned: bool,
+        gate_owned: bool,
+        reason: str,
+        *,
+        stop_joint: bool,
+    ) -> None:
+        try:
+            if rpc is not None and gate_owned and stop_joint:
+                self._real_sdk_stop_joint(rpc, reason, warn_only=True)
+        finally:
+            try:
+                self._real_sdk_exit_gate(gate_owned)
+            finally:
+                try:
+                    self._real_sdk_exit_control_owner(owner_owned)
+                finally:
+                    if rpc is not None:
+                        rpc.close()
 
     def _execute_real_sdk_move_joint(self, preview: GraspPreview) -> None:
         frames = preview.arm_trajectory_frames
@@ -1815,82 +2053,125 @@ class GraspPreviewNode(Node):
         accel = max(float(self.args.real_sdk_move_accel), 0.05)
         blend_radius = max(float(self.args.real_sdk_blend_radius), 0.0)
         duration_scale = max(float(self.args.real_sdk_segment_duration_scale), 0.0)
+        warm_session = self._take_real_sdk_warm_session()
+        prewarmed = warm_session is not None
         owner_owned = False
         gate_owned = False
+        rpc: AuboDirectJsonRpc | None = None
         self.get_logger().warn(
             f"sending REAL arm motion through Aubo SDK moveJoint: targets={len(targets)} "
-            f"rpc={ip}:{port} speed={speed:.3f}rad/s accel={accel:.3f}rad/s2"
+            f"rpc={ip}:{port} speed={speed:.3f}rad/s accel={accel:.3f}rad/s2 "
+            f"prewarmed={prewarmed}"
         )
 
-        with AuboDirectJsonRpc(ip, port, timeout) as rpc:
-            try:
+        try:
+            setup_start = time.monotonic()
+            if warm_session is not None:
+                rpc = warm_session.rpc
+                owner_owned = warm_session.owner_owned
+                gate_owned = warm_session.gate_owned
+                setup_done = time.monotonic()
+                self.get_logger().info(
+                    "grasp_timing sdk_motion_setup "
+                    "source=prewarmed "
+                    f"total={setup_done - setup_start:.3f}s "
+                    f"age={setup_done - warm_session.ready_at:.3f}s "
+                    f"since_trigger={self._real_trigger_elapsed():.3f}s"
+                )
+            else:
+                rpc = AuboDirectJsonRpc(ip, port, timeout)
+                rpc.connect()
+                connect_done = time.monotonic()
                 self.get_logger().info(f"Aubo SDK connect ok: robot={rpc.robot_name} rpc={ip}:{port}")
                 self._real_sdk_require_running(rpc)
+                mode_done = time.monotonic()
                 owner_owned = self._real_sdk_enter_control_owner()
+                owner_done = time.monotonic()
                 gate_owned = self._real_sdk_enter_gate()
+                gate_done = time.monotonic()
                 self._real_sdk_exit_servo_mode(rpc)
+                servo_done = time.monotonic()
                 self._real_sdk_stop_joint(rpc, "pre-move cleanup", warn_only=True)
-                self._open_real_gripper_before_motion()
+                cleanup_done = time.monotonic()
+                self.get_logger().info(
+                    "grasp_timing sdk_motion_setup "
+                    "source=fresh "
+                    f"total={cleanup_done - setup_start:.3f}s "
+                    f"connect={connect_done - setup_start:.3f}s "
+                    f"mode={mode_done - connect_done:.3f}s "
+                    f"owner={owner_done - mode_done:.3f}s "
+                    f"gate={gate_done - owner_done:.3f}s "
+                    f"servo={servo_done - gate_done:.3f}s "
+                    f"stop={cleanup_done - servo_done:.3f}s "
+                    f"since_trigger={self._real_trigger_elapsed():.3f}s"
+                )
+            self._open_real_gripper_before_motion()
 
-                previous_time = 0.0
-                closed = False
-                opened = False
-                (
-                    _close_start,
-                    _close_end,
-                    _open_start,
-                    _open_end,
-                    close_label,
-                    open_label,
-                ) = self._gripper_event_progresses(preview)
-                for index, (label, frame) in enumerate(targets, start=1):
-                    if self.stopping or not rclpy.ok():
-                        return
-                    target = [float(value) for value in frame.positions]
-                    segment_dt = max(float(frame.time_from_start) - previous_time, 0.0)
-                    duration = 0.0
-                    if duration_scale > 0.0:
-                        duration = max(
-                            segment_dt * duration_scale,
-                            max(float(self.args.real_sdk_min_segment_duration), 0.0),
-                        )
-                    result = rpc.robot_call(
-                        "MotionControl.moveJoint",
-                        [target, accel, speed, blend_radius, duration],
+            previous_time = 0.0
+            closed = False
+            opened = False
+            (
+                _close_start,
+                _close_end,
+                _open_start,
+                _open_end,
+                close_label,
+                open_label,
+            ) = self._gripper_event_progresses(preview)
+            for index, (label, frame) in enumerate(targets, start=1):
+                if self.stopping or not rclpy.ok():
+                    return
+                target = [float(value) for value in frame.positions]
+                segment_dt = max(float(frame.time_from_start) - previous_time, 0.0)
+                duration = 0.0
+                if duration_scale > 0.0:
+                    duration = max(
+                        segment_dt * duration_scale,
+                        max(float(self.args.real_sdk_min_segment_duration), 0.0),
                     )
-                    if result not in (0, None):
-                        raise RuntimeError(f"Aubo SDK moveJoint failed at {label}: result={result}")
-                    self.get_logger().warn(
-                        f"REAL moveJoint {index}/{len(targets)} {label}: "
-                        f"t={frame.time_from_start:.2f}s duration={duration:.2f}s"
-                    )
-                    self._real_sdk_wait_arrival(rpc, np.asarray(target, dtype=float), label, segment_dt)
-                    previous_time = float(frame.time_from_start)
+                result = rpc.robot_call(
+                    "MotionControl.moveJoint",
+                    [target, accel, speed, blend_radius, duration],
+                )
+                if result not in (0, None):
+                    raise RuntimeError(f"Aubo SDK moveJoint failed at {label}: result={result}")
+                self.get_logger().warn(
+                    f"REAL moveJoint {index}/{len(targets)} {label}: "
+                    f"t={frame.time_from_start:.2f}s duration={duration:.2f}s"
+                )
+                self._real_sdk_wait_arrival(rpc, np.asarray(target, dtype=float), label, segment_dt)
+                previous_time = float(frame.time_from_start)
 
-                    if bool(self.args.real_execute_gripper) and not closed:
-                        if label == close_label:
-                            self._publish_real_gripper("close")
-                            closed = True
-                            settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-                            if settle > 0.0:
-                                time.sleep(settle)
-                            self._require_real_gripper_capture_or_raise()
-                    if bool(self.args.real_execute_gripper) and not opened:
-                        if label == open_label:
-                            self._publish_real_gripper("open")
-                            opened = True
-                            settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-                            if settle > 0.0:
-                                time.sleep(settle)
-                if not self.stopping and rclpy.ok():
-                    self.get_logger().info("REAL arm SDK moveJoint sequence complete")
-            finally:
+                if bool(self.args.real_execute_gripper) and not closed:
+                    if label == close_label:
+                        self._publish_real_gripper("close")
+                        closed = True
+                        settle = max(float(self.args.real_gripper_settle_sec), 0.0)
+                        if settle > 0.0:
+                            time.sleep(settle)
+                        self._require_real_gripper_capture_or_raise()
+                if bool(self.args.real_execute_gripper) and not opened:
+                    if label == open_label:
+                        self._publish_real_gripper("open")
+                        opened = True
+                        settle = max(float(self.args.real_gripper_settle_sec), 0.0)
+                        if settle > 0.0:
+                            time.sleep(settle)
+            if not self.stopping and rclpy.ok():
+                self.get_logger().info("REAL arm SDK moveJoint sequence complete")
+        finally:
+            if rpc is not None:
                 try:
                     if gate_owned:
                         self._real_sdk_stop_joint(rpc, "post-move cleanup", warn_only=True)
                 finally:
-                    self._real_sdk_exit_gate(gate_owned)
-                    self._real_sdk_exit_control_owner(owner_owned)
+                    try:
+                        self._real_sdk_exit_gate(gate_owned)
+                    finally:
+                        try:
+                            self._real_sdk_exit_control_owner(owner_owned)
+                        finally:
+                            rpc.close()
 
     def _real_search_scan_loop(self) -> None:
         ip = str(self.args.real_sdk_ip)
@@ -3482,6 +3763,86 @@ class GraspPreviewNode(Node):
         x = pixel_x.astype(np.float32, copy=False) * z / fx
         y = pixel_y.astype(np.float32, copy=False) * z / fy
         return np.column_stack((x, y, z)).astype(np.float32, copy=False)
+
+    def _publish_preview_async(
+        self, preview: GraspPreview, source_header: Header, *, label: str
+    ) -> None:
+        threading.Thread(
+            target=self._publish_preview_worker,
+            args=(preview, source_header, label),
+            daemon=True,
+        ).start()
+
+    def _publish_preview_worker(
+        self, preview: GraspPreview, source_header: Header, label: str
+    ) -> None:
+        if self.stopping or not rclpy.ok():
+            return
+        start = time.monotonic()
+        try:
+            with self.preview_output_lock:
+                self._publish_preview(preview, source_header)
+        except RuntimeError as exc:
+            if "publisher's context is invalid" in str(exc):
+                return
+            self.get_logger().error(f"async preview publish failed: {exc}")
+            return
+        except Exception as exc:
+            self.get_logger().error(f"async preview publish failed: {type(exc).__name__}: {exc}")
+            return
+        done = time.monotonic()
+        self.get_logger().info(
+            f"grasp_timing preview_publish_done label={label} total={done - start:.3f}s"
+        )
+
+    def _publish_and_save_preview_async(
+        self,
+        preview: GraspPreview,
+        preview_header: Header,
+        annotated: np.ndarray,
+        raw: np.ndarray,
+        image_header: Header,
+    ) -> None:
+        threading.Thread(
+            target=self._publish_and_save_preview_worker,
+            args=(preview, preview_header, annotated, raw, image_header),
+            daemon=True,
+        ).start()
+
+    def _publish_and_save_preview_worker(
+        self,
+        preview: GraspPreview,
+        preview_header: Header,
+        annotated: np.ndarray,
+        raw: np.ndarray,
+        image_header: Header,
+    ) -> None:
+        if self.stopping or not rclpy.ok():
+            return
+        start = time.monotonic()
+        try:
+            with self.preview_output_lock:
+                publish_start = time.monotonic()
+                self._publish_preview(preview, preview_header)
+                self._publish_annotated(annotated, preview, image_header)
+                publish_done = time.monotonic()
+                self._save_latest(annotated, raw, preview)
+                save_done = time.monotonic()
+        except RuntimeError as exc:
+            if "publisher's context is invalid" in str(exc):
+                return
+            self.get_logger().error(f"async preview output failed: {exc}")
+            return
+        except Exception as exc:
+            self.get_logger().error(f"async preview output failed: {type(exc).__name__}: {exc}")
+            return
+        self.get_logger().info(
+            "grasp_timing preview_output_done "
+            f"label={preview.detection.label} reason={preview.snapshot_reason} "
+            f"total={save_done - start:.3f}s "
+            f"publish={publish_done - publish_start:.3f}s "
+            f"save={save_done - publish_done:.3f}s"
+        )
 
     def _publish_preview(self, preview: GraspPreview, source_header: Header) -> None:
         # ponytail: preview markers/clouds need current TF; keep coordinates in the camera frame.
@@ -6423,6 +6784,8 @@ class GraspPreviewNode(Node):
                 "backend": str(self.args.real_execute_backend),
                 "action": str(self.args.real_follow_action),
                 "sdk_rpc": f"{self.args.real_sdk_ip}:{int(self.args.real_sdk_rpc_port)}",
+                "sdk_prewarm": bool(self.args.real_sdk_prewarm),
+                "sdk_prewarm_wait_sec": float(self.args.real_sdk_prewarm_wait_sec),
                 "sdk_move_speed_rad_sec": float(self.args.real_sdk_move_speed),
                 "sdk_move_accel_rad_sec2": float(self.args.real_sdk_move_accel),
                 "joint_states_topic": str(self.args.real_joint_states_topic),
