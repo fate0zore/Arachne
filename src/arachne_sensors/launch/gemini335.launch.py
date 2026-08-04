@@ -25,6 +25,7 @@ def generate_launch_description():
                 "color_fourcc": LaunchConfiguration("color_fourcc"),
                 "color_yuv_layout": LaunchConfiguration("color_yuv_layout"),
                 "color_v4l2_controls": LaunchConfiguration("color_v4l2_controls"),
+                "color_capture_mode": LaunchConfiguration("color_capture_mode"),
                 "color_frame_id": LaunchConfiguration("color_frame_id"),
                 "publish_color": ParameterValue(
                     LaunchConfiguration("publish_color"), value_type=bool
@@ -71,6 +72,7 @@ def generate_launch_description():
                 ),
                 "camera_fx": ParameterValue(LaunchConfiguration("camera_fx"), value_type=float),
                 "camera_fy": ParameterValue(LaunchConfiguration("camera_fy"), value_type=float),
+                "factory_intrinsics_file": LaunchConfiguration("factory_intrinsics_file"),
                 "projection_flip_x": ParameterValue(
                     LaunchConfiguration("projection_flip_x"), value_type=bool
                 ),
@@ -160,6 +162,7 @@ def generate_launch_description():
             DeclareLaunchArgument("color_fourcc", default_value="YUYV"),
             DeclareLaunchArgument("color_yuv_layout", default_value="YUYV"),
             DeclareLaunchArgument("color_v4l2_controls", default_value=""),
+            DeclareLaunchArgument("color_capture_mode", default_value="opencv"),
             DeclareLaunchArgument("color_frame_id", default_value="camera_color_optical_frame"),
             DeclareLaunchArgument("publish_color", default_value="true"),
             DeclareLaunchArgument("depth_device", default_value="/dev/video0"),
@@ -180,14 +183,21 @@ def generate_launch_description():
             DeclareLaunchArgument("pointcloud_rate", default_value="5.0"),
             DeclareLaunchArgument("camera_fx", default_value="0.0"),
             DeclareLaunchArgument("camera_fy", default_value="0.0"),
+            # Path to factory calibration JSON (see scripts/vision/orbbec_factory_intrinsics.sh).
+            # Default is workspace-root-relative (matching teach_panel recording_dir style);
+            # empty means legacy behavior (camera_fx/camera_fy params or width*0.9 guess).
+            DeclareLaunchArgument(
+                "factory_intrinsics_file",
+                default_value="config/gemini335_intrinsics/factory_calibration.json",
+            ),
             DeclareLaunchArgument("projection_flip_x", default_value="true"),
             DeclareLaunchArgument("projection_flip_y", default_value="true"),
             DeclareLaunchArgument("camera_parent_frame", default_value="ee_camera_link"),
             DeclareLaunchArgument("camera_optical_x", default_value="0.0201"),
             DeclareLaunchArgument("camera_optical_y", default_value="0.0"),
-            DeclareLaunchArgument("camera_optical_z", default_value="0.2196"),
-            DeclareLaunchArgument("camera_optical_roll", default_value="0.196"),
-            DeclareLaunchArgument("camera_optical_pitch", default_value="-0.024"),
+            DeclareLaunchArgument("camera_optical_z", default_value="0.05"),
+            DeclareLaunchArgument("camera_optical_roll", default_value="0.0"),
+            DeclareLaunchArgument("camera_optical_pitch", default_value="0.0"),
             DeclareLaunchArgument("camera_optical_yaw", default_value="-1.570796327"),
             DeclareLaunchArgument("with_tf", default_value="true"),
             DeclareLaunchArgument("with_color_view", default_value="false"),

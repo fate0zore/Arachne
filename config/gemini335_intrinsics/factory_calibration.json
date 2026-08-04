@@ -1,0 +1,27 @@
+{
+  "format": "arachne_gemini335_factory_calibration_v1",
+  "sensor": "Gemini 335",
+  "exported_at": "2026-08-04T03:05:49Z",
+  "sdk_version": "1.10.27",
+  "source": "OrbbecSDK getCalibrationCameraParamList() (device-burned data)",
+  "streams": {
+    "color": {
+    "image_size": [640, 480],
+    "intrinsic": {"fx": 461.146637, "fy": 461.36908, "cx": 323.604004, "cy": 246.426437},
+    "distortion": [0.00529325148, -0.0473462343, 0.0324850604, 0, 0, 0, 0.000618236139, -4.67873906e-05],
+    "distortion_model": "modified_brown_conrady",
+    "is_mirrored": false
+  },
+    "depth": {
+    "image_size": [640, 480],
+    "intrinsic": {"fx": 372.082153, "fy": 372.082153, "cx": 319.400024, "cy": 241.5},
+    "distortion": [0, 0, 0, 0, 0, 0, 0, 0],
+    "distortion_model": "modified_brown_conrady",
+    "is_mirrored": false
+  }
+  },
+  "transform_depth_to_color": {
+    "rot": [0.999988079, -0.00243470469, -0.00423062639, 0.00242449879, 0.999994159, -0.00241581327, 0.00423648348, 0.00240552728, 0.999988139],
+    "trans": [-13.6681299, -0.136599287, -2.2318964]
+  }
+}

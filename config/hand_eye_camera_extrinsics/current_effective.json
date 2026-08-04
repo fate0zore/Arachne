@@ -1,0 +1,54 @@
+{
+  "format": "arachne_hand_eye_extrinsics_v1",
+  "name": "current_effective",
+  "saved_at": "2026-08-01T13:50:02",
+  "parent_frame": "ee_camera_link",
+  "child_frame": "camera_color_optical_frame",
+  "xyz": [
+    0.0201,
+    0.0,
+    0.05
+  ],
+  "rpy": [
+    0.0,
+    0.0,
+    -1.570796327
+  ],
+  "quaternion_xyzw": [
+    0.0,
+    0.0,
+    -0.7071067812,
+    0.7071067812
+  ],
+  "matrix_4x4": [
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0201
+    ],
+    [
+      -1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.05
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "source_json": "gemini335.launch.py default",
+  "sample_count": 0,
+  "mean_reprojection_error_px": 0.0,
+  "selected_method": "",
+  "notes": "当前真实生效的相机外参（gemini335.launch.py 默认值），保存后可在 config 界面选择。"
+}

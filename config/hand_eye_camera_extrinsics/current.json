@@ -1,0 +1,5 @@
+{
+  "current": "current_effective.json",
+  "saved_at": "2026-08-04T13:15:50",
+  "note": "2026-08-04 13:15 新标定 hand_eye_20260804_131502.json 离线校验不可信（5 方法 span 0.47/1.73/2.51 m、固定 X 投影 mean 320 mm、姿态覆盖 63°），已回滚 launch/config 至物理先验经验值"
+}

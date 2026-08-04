@@ -40,9 +40,10 @@ def generate_launch_description():
                     "depth_width:=640 depth_height:=480 depth_fps:=15.0 "
                     "color_v4l2_controls:=brightness=20,exposure_auto=0,exposure_absolute=45,gain=0 "
                     "camera_optical_x:=0.0201 camera_optical_y:=0.0 "
-                    "camera_optical_z:=0.2196 camera_optical_roll:=0.196 "
-                    "camera_optical_pitch:=-0.024 camera_optical_yaw:=-1.570796327 "
-                    "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV"
+                    "camera_optical_z:=0.05 camera_optical_roll:=0.0 "
+                    "camera_optical_pitch:=0.0 camera_optical_yaw:=-1.570796327 "
+                    "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV "
+                    "color_capture_mode:=v4l2-ctl"
                 ),
             ),
             DeclareLaunchArgument(

@@ -18,6 +18,7 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import cv2
 import numpy as np
 import rclpy
 from control_msgs.action import FollowJointTrajectory
@@ -31,7 +32,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -42,6 +43,7 @@ from arachne_operator.control_owner import (
     release_control_owner as _release_control_owner,
 )
 from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
+from arachne_operator.hand_eye_calibration_check import check_calibration, check_pose
 from arachne_operator.repo_paths import root_dir
 
 
@@ -66,6 +68,28 @@ DEFAULT_REAR_RACK_KEEPOUT_MIN_XYZ = "-0.41,-0.22,0.04"
 DEFAULT_REAR_RACK_KEEPOUT_MAX_XYZ = "0.09,0.22,0.82"
 DEFAULT_TEACH_CONFIG_PATH = "recordings/teach/teach_panel_config.json"
 DEFAULT_DEMO_RECORDING_PATH = "recordings/teach/arachne_teach_20260629_213710.json"
+DEFAULT_HAND_EYE_EXTRINSICS_DIR = "config/hand_eye_camera_extrinsics"
+HAND_EYE_EXTRINSICS_FORMAT = "arachne_hand_eye_extrinsics_v1"
+CURRENT_HAND_EYE_EXTRINSICS_NAME = "current.json"
+# 当前真实生效的相机外参，与 src/arachne_sensors/launch/gemini335.launch.py 默认值保持一致
+CURRENT_HAND_EYE_PARENT_FRAME = "ee_camera_link"
+CURRENT_HAND_EYE_CHILD_FRAME = "camera_color_optical_frame"
+CURRENT_HAND_EYE_XYZ = [0.0201, 0.0, 0.05]
+CURRENT_HAND_EYE_RPY = [0.0, 0.0, -1.570796327]
+
+
+def _quality_summary_lines(quality: dict) -> str:
+    """把质量报告的 fail/warn 项格式化为多行文本（UI 软告警弹窗/摘要用）。"""
+    fails = [i for i in quality["items"] if i["status"] == "fail"]
+    warns = [i for i in quality["items"] if i["status"] == "warn"]
+    lines = []
+    for i in fails:
+        lines.append(f"  ✗ {i['name']}: {i['value']} {i['unit']} ({i['detail']})")
+    for i in warns:
+        lines.append(f"  △ {i['name']}: {i['value']} {i['unit']} ({i['detail']})")
+    if not lines:
+        lines.append("  全部指标达标")
+    return "\n".join(lines)
 DEFAULT_AUBO_TEACH_FLAG_PATH = "/tmp/arachne_aubo_teach_mode"
 GRIPPER_PRESET_COMMANDS = ("12000", "9000", "6000")
 GRIPPER_CUSTOM_MIN = 0
@@ -79,6 +103,7 @@ MANAGED_SERVICE_COMMAND_PARAMS = {
     "grasp_server": "grasp_server_command",
     "cleanup_server": "cleanup_server_command",
     "step_cleanup_server": "step_cleanup_server_command",
+    "hand_eye_calibrator": "hand_eye_calibrator_command",
 }
 MANAGED_SERVICE_READY_SERVICES = {
     "grasp_server": ("/arachne/grasp_task/status", "/arachne/grasp_task/start"),
@@ -248,6 +273,152 @@ def _transform_from_xyz_rpy(xyz: np.ndarray, rpy: np.ndarray) -> np.ndarray:
     return transform
 
 
+# URDF 静态链路 tool0 -> ee_camera_link（手眼标定结果换算为运行时外参用）:
+#   aubo_tool0_joint:        aubo_wrist3_Link -> tool0              origin (0,0,0)        rpy (0,0, 90deg)
+#   ee_camera_support_joint: aubo_wrist3_Link -> ee_camera_support_link  origin (0,0,0)   rpy (0,0,135deg)
+#   ee_camera_joint:         ee_camera_support_link -> ee_camera_link    origin (0,-0.0741,0.005) rpy (0,0,90deg)
+_TOOL0_TO_EE_CAMERA_LINK = _transform_from_xyz_rpy(
+    np.zeros(3), np.array([0.0, 0.0, -math.pi / 2.0])
+) @ _transform_from_xyz_rpy(
+    np.zeros(3), np.array([0.0, 0.0, math.pi * 0.75])
+) @ _transform_from_xyz_rpy(
+    np.array([0.0, -0.0741, 0.005]), np.array([0.0, 0.0, math.pi / 2.0])
+)
+
+
+def _matrix_to_xyz_rpy(matrix: np.ndarray) -> tuple[list[float], list[float]]:
+    """从 4x4 变换矩阵提取 xyz 平移与 RPY，顺序与 _rotation_matrix_from_rpy（Rz*Ry*Rx）一致。"""
+    m = matrix
+    xyz = [float(m[0, 3]), float(m[1, 3]), float(m[2, 3])]
+    pitch = math.atan2(-m[2, 0], math.hypot(m[2, 1], m[2, 2]))
+    if abs(math.cos(pitch)) > 1e-9:
+        yaw = math.atan2(m[1, 0], m[0, 0])
+        roll = math.atan2(m[2, 1], m[2, 2])
+    else:
+        yaw = math.atan2(-m[0, 1], m[1, 1])
+        roll = 0.0
+    return xyz, [roll, pitch, yaw]
+
+
+def _quaternion_xyzw_from_matrix(matrix: np.ndarray) -> list[float]:
+    """从旋转矩阵提取四元数（x,y,z,w），Shepperd 数值稳定算法。"""
+    m = matrix[:3, :3]
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    return [float(x), float(y), float(z), float(w)]
+
+
+def hand_eye_extrinsics_payload(
+    name: str,
+    xyz: list[float],
+    rpy: list[float],
+    *,
+    parent_frame: str = CURRENT_HAND_EYE_PARENT_FRAME,
+    child_frame: str = CURRENT_HAND_EYE_CHILD_FRAME,
+    source_json: str = "",
+    sample_count: int = 0,
+    mean_reprojection_error_px: float = 0.0,
+    selected_method: str = "",
+    notes: str = "",
+) -> dict:
+    """生成 config 界面所需的外参配置 JSON 内容（arachne_hand_eye_extrinsics_v1）。"""
+    matrix = _transform_from_xyz_rpy(np.asarray(xyz, dtype=float), np.asarray(rpy, dtype=float))
+    return {
+        "format": HAND_EYE_EXTRINSICS_FORMAT,
+        "name": name,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "parent_frame": parent_frame,
+        "child_frame": child_frame,
+        "xyz": [float(value) for value in xyz],
+        "rpy": [float(value) for value in rpy],
+        "quaternion_xyzw": _quaternion_xyzw_from_matrix(matrix),
+        "matrix_4x4": matrix.tolist(),
+        "source_json": source_json,
+        "sample_count": int(sample_count),
+        "mean_reprojection_error_px": float(mean_reprojection_error_px),
+        "selected_method": selected_method,
+        "notes": notes,
+    }
+
+
+def hand_eye_convert_tool0_to_ee_camera(
+    calibration: dict,
+) -> tuple[list[float], list[float], np.ndarray]:
+    """把手眼标定 JSON（tool0 -> camera_color_optical_frame）离线换算为运行时外参
+    ee_camera_link -> camera_*_optical_frame，返回 (xyz, rpy, matrix_4x4)。
+
+    不依赖 /tf 与机械臂在线，纯 URDF 静态链路推导。"""
+    tool0_to_camera = np.asarray(calibration["gripper_to_camera"]["matrix"], dtype=float)
+    ee_camera_to_tool0 = np.linalg.inv(_TOOL0_TO_EE_CAMERA_LINK)
+    matrix = ee_camera_to_tool0 @ tool0_to_camera
+    xyz, rpy = _matrix_to_xyz_rpy(matrix)
+    return xyz, rpy, matrix
+
+
+def rewrite_hand_eye_launch_values(paths: list[Path], xyz: list[float], rpy: list[float]) -> dict[str, str]:
+    """把 camera_optical_* 的 xyz/rpy 写入给定 launch/帮助文本文件，改写前备份 .bak。
+
+    纯文本改写，不依赖 ROS 节点；返回 {路径: 摘要}。gemini335.launch.py 使用
+    DeclareLaunchArgument default_value= 形式，其余文件使用 camera_optical_*:= 参数形式。"""
+    values = {
+        axis: repr(float(value))
+        for axis, value in zip(("x", "y", "z", "roll", "pitch", "yaw"), [*xyz, *rpy])
+    }
+    results: dict[str, str] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        original = path.read_text(encoding="utf-8")
+        if path.name == "gemini335.launch.py":
+            updated = original
+            for axis, value in values.items():
+                updated = re.sub(
+                    rf'DeclareLaunchArgument\("camera_optical_{axis}", default_value="[^"]*"\)',
+                    f'DeclareLaunchArgument("camera_optical_{axis}", default_value="{value}")',
+                    updated,
+                )
+        else:
+            updated = original
+            for axis, value in values.items():
+                updated = re.sub(
+                    rf"camera_optical_{axis}:=(-?[\d.]+)",
+                    f"camera_optical_{axis}:={value}",
+                    updated,
+                )
+        if updated == original:
+            results[str(path)] = "no change (pattern not found)"
+            continue
+        backup = path.with_suffix(path.suffix + ".bak")
+        if not backup.exists():
+            backup.write_text(original, encoding="utf-8")
+        path.write_text(updated, encoding="utf-8")
+        results[str(path)] = "updated"
+    return results
+
+
 def _normalize_gripper_command(command: object) -> str | None:
     text = str(command).strip().lower()
     if text in ("open", "close", "stop"):
@@ -377,6 +548,19 @@ class TeachPanelNode(Node):
         self.declare_parameter("recording_dir", "recordings/teach")
         self.declare_parameter("teach_config_path", DEFAULT_TEACH_CONFIG_PATH)
         self.declare_parameter("teach_config_autoload", True)
+        self.declare_parameter("hand_eye_extrinsics_dir", DEFAULT_HAND_EYE_EXTRINSICS_DIR)
+        self.declare_parameter("camera_image_topic", "/camera/color/image_raw")
+        self.declare_parameter("intrinsic_cal_dir", "recordings/calibration/intrinsics")
+        # 复用现有 AprilTag 手眼标定板(与 apriltag_hand_eye_calibrator 默认一致)
+        self.declare_parameter(
+            "intrinsic_board_image_path",
+            "/home/jetson/zhaoyang/arachne_floor_apriltag_board_a3.png",
+        )
+        self.declare_parameter("intrinsic_board_width_m", 0.420)
+        self.declare_parameter("intrinsic_board_height_m", 0.297)
+        self.declare_parameter("intrinsic_tag_size_m", 0.070)
+        self.declare_parameter("intrinsic_tag_pitch_m", 0.100)
+        self.declare_parameter("intrinsic_tag_family", "tagStandard41h12")
         self.declare_parameter("workspace_root", "")
         self.declare_parameter("runtime_log_root", "log/teach_panel")
         self.declare_parameter(
@@ -394,8 +578,8 @@ class TeachPanelNode(Node):
                 "depth_width:=640 depth_height:=480 depth_fps:=15.0 "
                 "color_v4l2_controls:=brightness=20,exposure_auto=0,exposure_absolute=45,gain=0 "
                 "camera_optical_x:=0.0201 camera_optical_y:=0.0 "
-                "camera_optical_z:=0.2196 camera_optical_roll:=0.196 "
-                "camera_optical_pitch:=-0.024 camera_optical_yaw:=-1.570796327 "
+                "camera_optical_z:=0.05 camera_optical_roll:=0.0 "
+                "camera_optical_pitch:=0.0 camera_optical_yaw:=-1.570796327 "
                 "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV"
             ),
         )
@@ -492,6 +676,10 @@ class TeachPanelNode(Node):
             "step_cleanup_server_command",
             "ros2 launch arachne_operator step_cleanup_demo.launch.py",
         )
+        self.declare_parameter(
+            "hand_eye_calibrator_command",
+            "ros2 run arachne_operator apriltag_hand_eye_calibrator",
+        )
         self.declare_parameter("grasp_task_state_topic", "/arachne/grasp_task/state")
         self.declare_parameter("grasp_task_start_service", "/arachne/grasp_task/start")
         self.declare_parameter("grasp_task_stop_service", "/arachne/grasp_task/stop")
@@ -515,6 +703,15 @@ class TeachPanelNode(Node):
         self.declare_parameter("step_cleanup_stop_service", "/arachne/step_cleanup/stop")
         self.declare_parameter("step_cleanup_status_service", "/arachne/step_cleanup/status")
         self.declare_parameter("step_cleanup_preflight_service", "/arachne/step_cleanup/preflight")
+        self.declare_parameter(
+            "hand_eye_capture_service", "/arachne_apriltag_hand_eye_calibrator/capture"
+        )
+        self.declare_parameter(
+            "hand_eye_solve_service", "/arachne_apriltag_hand_eye_calibrator/solve"
+        )
+        self.declare_parameter(
+            "hand_eye_reset_service", "/arachne_apriltag_hand_eye_calibrator/reset"
+        )
         self.declare_parameter("skip_task_preflight", True)
 
         self.arm_state_joint_names = _parse_names(str(self.get_parameter("arm_state_joint_names").value))
@@ -607,6 +804,17 @@ class TeachPanelNode(Node):
                 Trigger, str(self.get_parameter("step_cleanup_preflight_service").value)
             ),
         }
+        self.hand_eye_clients = {
+            "capture": self.create_client(
+                Trigger, str(self.get_parameter("hand_eye_capture_service").value)
+            ),
+            "solve": self.create_client(
+                Trigger, str(self.get_parameter("hand_eye_solve_service").value)
+            ),
+            "reset": self.create_client(
+                Trigger, str(self.get_parameter("hand_eye_reset_service").value)
+            ),
+        }
 
         self.create_subscription(Odometry, odom_topic, self._odom_callback, 10)
         self.create_subscription(JointState, joint_states_topic, self._joint_state_callback, 10)
@@ -631,6 +839,12 @@ class TeachPanelNode(Node):
             String,
             str(self.get_parameter("step_cleanup_state_topic").value),
             self._step_cleanup_state_callback,
+            10,
+        )
+        self.create_subscription(
+            Image,
+            str(self.get_parameter("camera_image_topic").value),
+            self._intrinsic_image_cb,
             10,
         )
 
@@ -663,6 +877,11 @@ class TeachPanelNode(Node):
             "Grasp": "waiting",
             "Road": "waiting",
         }
+        self.hand_eye_busy = False  # 手眼标定服务调用期间置位,避免并发触发
+        self.hand_eye_last_result = "no result yet"
+        self.intrinsic_latest_image: Image | None = None  # Camera Cal 最近一帧(bgr8)
+        self.intrinsic_busy = False  # 采集文件操作期间置位,避免并发捕获/删除互相覆盖
+        self.intrinsic_lock = threading.Lock()  # 串行化 capture/delete/clear 的计数与 manifest 读写
         self.aubo_teach_gate_active = False
         self.aubo_teach_ready_event = threading.Event()
         self.aubo_teach_ready_event.set()
@@ -924,6 +1143,10 @@ class TeachPanelNode(Node):
             self.hardware_status["Step"] = label
         self._log_hardware_status_change("Step", label)
 
+    def _intrinsic_image_cb(self, msg: Image) -> None:
+        # 引用赋值原子,采集线程在 worker 中读取;不做拷贝以降低回调开销
+        self.intrinsic_latest_image = msg
+
     def snapshot(self) -> dict[str, str]:
         with self.lock:
             base = self.base_pose
@@ -970,6 +1193,9 @@ class TeachPanelNode(Node):
                 "grasp_server": managed["grasp_server"],
                 "cleanup_server": managed["cleanup_server"],
                 "step_cleanup_server": managed["step_cleanup_server"],
+                "hand_eye_calibrator": managed["hand_eye_calibrator"],
+                "hand_eye_busy": "busy" if self.hand_eye_busy else "idle",
+                "hand_eye_last_result": self.hand_eye_last_result,
                 "log_dir": str(self.runtime_log_dir),
                 **self.hardware_status,
             }
@@ -1028,6 +1254,198 @@ class TeachPanelNode(Node):
         )
         config_path.parent.mkdir(parents=True, exist_ok=True)
         return config_path
+
+    def hand_eye_extrinsics_dir(self) -> Path:
+        return self._workspace_path(str(self.get_parameter("hand_eye_extrinsics_dir").value))
+
+    def _hand_eye_launch_paths(self) -> list[Path]:
+        """需要同步改写 camera_optical_* 默认值的 3 处文件。"""
+        return [
+            self.workspace_root / "src/arachne_sensors/launch/gemini335.launch.py",
+            self.workspace_root / "src/arachne_operator/launch/teach_panel.launch.py",
+            self.workspace_root / "src/arachne_operator/arachne_operator/teach_panel.py",
+        ]
+
+    def current_hand_eye_extrinsics(self) -> dict:
+        """当前真实生效的相机外参（与 gemini335.launch.py 默认值一致），返回 config payload。"""
+        return hand_eye_extrinsics_payload(
+            "current_effective",
+            CURRENT_HAND_EYE_XYZ,
+            CURRENT_HAND_EYE_RPY,
+            parent_frame=CURRENT_HAND_EYE_PARENT_FRAME,
+            child_frame=CURRENT_HAND_EYE_CHILD_FRAME,
+            source_json="gemini335.launch.py default",
+            notes="当前真实生效的相机外参（gemini335.launch.py 默认值），保存后可在 config 界面选择。",
+        )
+
+    def save_current_hand_eye_config(self, *, status: bool = True) -> Path:
+        """把当前生效外参保存为 config 格式 JSON，并更新 current 标记。"""
+        directory = self.hand_eye_extrinsics_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = self.current_hand_eye_extrinsics()
+        path = directory / "current_effective.json"
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (directory / CURRENT_HAND_EYE_EXTRINSICS_NAME).write_text(
+            json.dumps(
+                {
+                    "current": path.name,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        if status:
+            self._status(f"hand-eye current extrinsics saved: {path}")
+        return path
+
+    def list_hand_eye_extrinsics(self) -> list[dict]:
+        """列出外参目录下所有 config 格式 JSON（不含 current.json 标记）。"""
+        directory = self.hand_eye_extrinsics_dir()
+        if not directory.exists():
+            return []
+        entries: list[dict] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name == CURRENT_HAND_EYE_EXTRINSICS_NAME:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if payload.get("format") != HAND_EYE_EXTRINSICS_FORMAT:
+                continue
+            entries.append(
+                {
+                    "filename": path.name,
+                    "name": str(payload.get("name", path.stem)),
+                    "path": str(path),
+                    "payload": payload,
+                }
+            )
+        return entries
+
+    def read_hand_eye_extrinsics(self, filename: str) -> dict | None:
+        path = self.hand_eye_extrinsics_dir() / Path(filename).name
+        if not path.exists() or path.name == CURRENT_HAND_EYE_EXTRINSICS_NAME:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if payload.get("format") != HAND_EYE_EXTRINSICS_FORMAT:
+            return None
+        return payload
+
+    def current_hand_eye_config_name(self) -> str | None:
+        marker = self.hand_eye_extrinsics_dir() / CURRENT_HAND_EYE_EXTRINSICS_NAME
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        current = str(data.get("current", ""))
+        return current or None
+
+    def _rewrite_launch_hand_eye_values(self, xyz, rpy) -> dict[str, str]:
+        """把 xyz/rpy 写入 3 处 launch 文本（改写前备份 .bak），返回 {路径: 摘要}。"""
+        return rewrite_hand_eye_launch_values(self._hand_eye_launch_paths(), xyz, rpy)
+
+    def apply_hand_eye_extrinsics(self, filename: str, *, status: bool = True) -> dict:
+        """把选中外参写入 launch 默认值（3 处）并更新 current 标记。"""
+        payload = self.read_hand_eye_extrinsics(filename)
+        if payload is None:
+            raise ValueError(f"hand-eye extrinsics not found: {filename}")
+        xyz = [float(value) for value in payload["xyz"]]
+        rpy = [float(value) for value in payload["rpy"]]
+        results = self._rewrite_launch_hand_eye_values(xyz, rpy)
+        directory = self.hand_eye_extrinsics_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / CURRENT_HAND_EYE_EXTRINSICS_NAME).write_text(
+            json.dumps(
+                {
+                    "current": filename,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        if status:
+            self._status(f"hand-eye extrinsics applied: {filename} (restart to take effect)")
+        return {"results": results, "filename": filename}
+
+    def convert_calibration_to_extrinsics(self, json_path: str | Path) -> dict:
+        """读取标定 JSON（tool0->camera），离线换算为 ee_camera_link->camera 外参。
+
+        返回 dict：payload（config 格式）、xyz、rpy、matrix、diff_vs_current、质量信息。"""
+        path = Path(str(json_path)).expanduser()
+        calibration = json.loads(path.read_text(encoding="utf-8"))
+        gripper_to_camera = calibration.get("gripper_to_camera")
+        if not isinstance(gripper_to_camera, dict) or "matrix" not in gripper_to_camera:
+            raise ValueError(f"不是手眼标定结果 JSON（缺少 gripper_to_camera.matrix）: {path}")
+        xyz, rpy, matrix = hand_eye_convert_tool0_to_ee_camera(calibration)
+        quality = check_calibration(calibration)
+        sample_count = int(calibration.get("sample_count", calibration.get("num_samples", 0)) or 0)
+        error = float(calibration.get("mean_reprojection_error_px", 0.0) or 0.0)
+        payload = hand_eye_extrinsics_payload(
+            path.stem,
+            xyz,
+            rpy,
+            parent_frame=CURRENT_HAND_EYE_PARENT_FRAME,
+            child_frame=CURRENT_HAND_EYE_CHILD_FRAME,
+            source_json=str(path),
+            sample_count=sample_count,
+            mean_reprojection_error_px=error,
+            selected_method=str(calibration.get("selected_method", "")),
+            notes="由手眼标定 JSON 离线换算（tool0→camera → ee_camera_link→camera）。",
+        )
+        payload["converted_from"] = True
+        diff = [
+            round(float(a) - float(b), 6)
+            for a, b in zip(
+                [*xyz, *rpy],
+                [*CURRENT_HAND_EYE_XYZ, *CURRENT_HAND_EYE_RPY],
+            )
+        ]
+        return {
+            "payload": payload,
+            "xyz": xyz,
+            "rpy": rpy,
+            "matrix": matrix.tolist(),
+            "diff_vs_current": diff,
+            "source": str(path),
+            "sample_count": sample_count,
+            "mean_reprojection_error_px": error,
+            "selected_method": str(calibration.get("selected_method", "")),
+            "quality": quality,
+        }
+
+    def save_hand_eye_extrinsics_payload(self, payload: dict, *, set_current: bool = True) -> Path:
+        """把 config 格式外参 payload 写入 config/hand_eye_camera_extrinsics/，可选设为 current。"""
+        directory = self.hand_eye_extrinsics_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        name = str(payload.get("name", "hand_eye_extrinsics")).replace("/", "_")
+        data = dict(payload)
+        data["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        path = directory / f"{name}.json"
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        if set_current:
+            (directory / CURRENT_HAND_EYE_EXTRINSICS_NAME).write_text(
+                json.dumps(
+                    {
+                        "current": path.name,
+                        "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        self._status(f"hand-eye extrinsics saved: {path}")
+        return path
 
     def current_joints_degrees(self) -> list[float] | None:
         current = self._current_arm_vector()
@@ -1660,6 +2078,214 @@ class TeachPanelNode(Node):
             self._status(f"step cleanup ignored unknown command: {command}", warn=True)
             return
         self._start_worker(lambda: self._call_step_cleanup_worker(command))
+
+    def call_hand_eye_service(self, command: str) -> None:
+        command = str(command).strip().lower()
+        if command not in self.hand_eye_clients:
+            self._status(f"hand-eye ignored unknown command: {command}", warn=True)
+            return
+        with self.lock:
+            if self.hand_eye_busy:
+                self._status("hand-eye service busy: wait for the current call", warn=True)
+                return
+            self.hand_eye_busy = True
+        self._start_worker(lambda: self._call_hand_eye_service_worker(command))
+
+    def _call_hand_eye_service_worker(self, command: str) -> None:
+        client = self.hand_eye_clients.get(command)
+        try:
+            if client is None:
+                self._status(f"hand-eye service missing: {command}", warn=True)
+                return
+            service_name = getattr(client, "srv_name", command)
+            self._status(f"hand-eye {command} requested")
+            if not client.wait_for_service(timeout_sec=4.0):
+                message = (
+                    f"hand-eye {command} unavailable: {service_name} "
+                    "(is the calibrator node running?)"
+                )
+                self._status(message, warn=True)
+                with self.lock:
+                    self.hand_eye_last_result = message
+                return
+            future = client.call_async(Trigger.Request())
+            if not self._wait_service_future(future, 15.0):
+                message = f"hand-eye {command} timeout: {service_name}"
+                self._status(message, warn=True)
+                with self.lock:
+                    self.hand_eye_last_result = message
+                return
+            response = future.result()
+            success = bool(response.success) if response is not None else False
+            message = response.message if response is not None else "empty response"
+            self._status(
+                f"hand-eye {command} {'ok' if success else 'failed'}: {message}",
+                warn=not success,
+            )
+            with self.lock:
+                self.hand_eye_last_result = (
+                    f"[{command}] {'ok' if success else 'failed'}: {message}"
+                )
+        finally:
+            with self.lock:
+                self.hand_eye_busy = False
+
+    # ---- Camera Cal: 相机内参标定图像采集 ----
+
+    def _intrinsic_begin(self) -> bool:
+        with self.lock:
+            if self.intrinsic_busy:
+                return False
+            self.intrinsic_busy = True
+            return True
+
+    def _intrinsic_end(self) -> None:
+        with self.lock:
+            self.intrinsic_busy = False
+
+    def _intrinsic_directory(self, directory: str | Path | None) -> Path:
+        if directory is not None and str(directory).strip():
+            return self._workspace_path(str(directory).strip())
+        return self._workspace_path(str(self.get_parameter("intrinsic_cal_dir").value))
+
+    def _intrinsic_manifest_path(self, directory: Path) -> Path:
+        return directory / "capture_manifest.json"
+
+    def _intrinsic_manifest(self, directory: Path) -> list[dict]:
+        manifest = self._intrinsic_manifest_path(directory)
+        if not manifest.is_file():
+            return []
+        try:
+            entries = json.loads(manifest.read_text())
+            return entries if isinstance(entries, list) else []
+        except (ValueError, OSError) as exc:
+            # 坏 JSON 不静默覆写:告警后按空处理,由调用方重建
+            self._status(f"intrinsic manifest unreadable, will rebuild: {exc}", warn=True)
+            return []
+
+    def _intrinsic_write_manifest(self, directory: Path, entries: list[dict]) -> None:
+        self._intrinsic_manifest_path(directory).write_text(json.dumps(entries, indent=2))
+
+    def intrinsic_capture_count(self, directory: str | Path | None = None) -> int:
+        target = self._intrinsic_directory(directory)
+        if not target.is_dir():
+            return 0
+        return len(list(target.glob("frame_*.png")))
+
+    def intrinsic_board_params(self) -> dict:
+        """当前标定板参数(写入 manifest,供离线 cv2.calibrateCamera 复用)。"""
+        return {
+            "board_image_path": str(self.get_parameter("intrinsic_board_image_path").value),
+            "board_width_m": float(self.get_parameter("intrinsic_board_width_m").value),
+            "board_height_m": float(self.get_parameter("intrinsic_board_height_m").value),
+            "tag_size_m": float(self.get_parameter("intrinsic_tag_size_m").value),
+            "tag_pitch_m": float(self.get_parameter("intrinsic_tag_pitch_m").value),
+            "tag_family": str(self.get_parameter("intrinsic_tag_family").value),
+        }
+
+    def capture_intrinsic_image(
+        self,
+        board_params: dict | None = None,
+        directory: str | Path | None = None,
+    ) -> Path | None:
+        """保存最新一帧为 PNG 并追加 manifest(Camera Cal 采集)。"""
+        if not self._intrinsic_begin():
+            self._status("intrinsic capture busy: wait for the current operation", warn=True)
+            return None
+        try:
+            image = self.intrinsic_latest_image
+            if image is None:
+                self._status(
+                    "intrinsic capture skipped: no camera frame yet (start Camera)", warn=True
+                )
+                return None
+            if image.encoding != "bgr8":
+                self._status(
+                    f"intrinsic capture skipped: unsupported encoding {image.encoding} (expect bgr8)",
+                    warn=True,
+                )
+                return None
+            if image.step != image.width * 3 or len(image.data) != image.step * image.height:
+                self._status(
+                    f"intrinsic capture skipped: unexpected image geometry "
+                    f"{image.width}x{image.height} step={image.step} len={len(image.data)}",
+                    warn=True,
+                )
+                return None
+            with self.intrinsic_lock:
+                target = self._intrinsic_directory(directory)
+                target.mkdir(parents=True, exist_ok=True)
+                count = len(list(target.glob("frame_*.png")))
+                name = f"frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{count + 1:03d}.png"
+                path = target / name
+                frame = np.frombuffer(bytes(image.data), dtype=np.uint8).reshape(
+                    image.height, image.width, 3
+                )
+                if not cv2.imwrite(str(path), frame):
+                    self._status(f"intrinsic capture failed to write: {path}", warn=True)
+                    return None
+                entries = self._intrinsic_manifest(target)
+                entries.append(
+                    {
+                        "file": name,
+                        "stamp_ns": (
+                            int(image.header.stamp.sec) * 1_000_000_000
+                            + int(image.header.stamp.nanosec)
+                        ),
+                        "board": (
+                            board_params if board_params is not None else self.intrinsic_board_params()
+                        ),
+                    }
+                )
+                self._intrinsic_write_manifest(target, entries)
+                self._status(f"intrinsic capture saved: {name} (total {count + 1})")
+                return path
+        finally:
+            self._intrinsic_end()
+
+    def delete_last_intrinsic_capture(self, directory: str | Path | None = None) -> Path | None:
+        """删除最后一张采集图像(按文件名排序)。"""
+        if not self._intrinsic_begin():
+            self._status("intrinsic delete busy: wait for the current operation", warn=True)
+            return None
+        try:
+            with self.intrinsic_lock:
+                target = self._intrinsic_directory(directory)
+                files = sorted(target.glob("frame_*.png")) if target.is_dir() else []
+                if not files:
+                    self._status("intrinsic delete skipped: no captured images", warn=True)
+                    return None
+                last = files[-1]
+                last.unlink()
+                entries = [
+                    entry
+                    for entry in self._intrinsic_manifest(target)
+                    if entry.get("file") != last.name
+                ]
+                self._intrinsic_write_manifest(target, entries)
+                self._status(f"intrinsic capture deleted: {last.name} (total {len(files) - 1})")
+                return last
+        finally:
+            self._intrinsic_end()
+
+    def clear_intrinsic_captures(self, directory: str | Path | None = None) -> int:
+        """清空采集目录(仅删除本工具生成的 frame_*.png 与 manifest)。"""
+        if not self._intrinsic_begin():
+            self._status("intrinsic clear busy: wait for the current operation", warn=True)
+            return 0
+        try:
+            with self.intrinsic_lock:
+                target = self._intrinsic_directory(directory)
+                files = sorted(target.glob("frame_*.png")) if target.is_dir() else []
+                for path in files:
+                    path.unlink()
+                manifest = self._intrinsic_manifest_path(target)
+                if manifest.is_file():
+                    manifest.unlink()
+                self._status(f"intrinsic captures cleared: removed {len(files)} image(s)")
+                return len(files)
+        finally:
+            self._intrinsic_end()
 
     def visual_grasp_start(self, release_point: str | None = None) -> None:
         self._start_worker(lambda: self._visual_grasp_start_worker(release_point))
@@ -4110,6 +4736,26 @@ class TeachPanelApp:
         self.config_path_var = tk.StringVar(
             value=str(node.get_parameter("teach_config_path").value)
         )
+        self.intrinsic_board_path_var = tk.StringVar(
+            value=str(node.get_parameter("intrinsic_board_image_path").value)
+        )
+        self.intrinsic_board_w_var = tk.StringVar(
+            value=f"{float(node.get_parameter('intrinsic_board_width_m').value):.3f}"
+        )
+        self.intrinsic_board_h_var = tk.StringVar(
+            value=f"{float(node.get_parameter('intrinsic_board_height_m').value):.3f}"
+        )
+        self.intrinsic_tag_size_var = tk.StringVar(
+            value=f"{float(node.get_parameter('intrinsic_tag_size_m').value):.3f}"
+        )
+        self.intrinsic_tag_pitch_var = tk.StringVar(
+            value=f"{float(node.get_parameter('intrinsic_tag_pitch_m').value):.3f}"
+        )
+        self.intrinsic_cal_dir_var = tk.StringVar(
+            value=str(node.get_parameter("intrinsic_cal_dir").value)
+        )
+        self.intrinsic_count_var = tk.StringVar(value="0")
+        self.intrinsic_last_var = tk.StringVar(value="尚未采集")
         self.base_only_run_var = tk.BooleanVar(value=False)
         self.hide_program_tree_var = tk.BooleanVar(value=False)
         self.joint_target_vars = [tk.StringVar(value="") for _ in range(6)]
@@ -4164,6 +4810,8 @@ class TeachPanelApp:
         self._build_move_tab()
         self._build_demo_tab()
         self._build_program_tab()
+        self._build_hand_eye_tab()
+        self._build_camera_cal_tab()
         self._build_config_tab()
         self._build_log_tab()
 
@@ -4657,6 +5305,288 @@ class TeachPanelApp:
             row=2, column=2, sticky="ew", padx=5, pady=5
         )
 
+    def _build_hand_eye_tab(self) -> None:
+        tab = self._add_scrollable_tab("Hand Eye")
+        tab.columnconfigure(0, weight=1)
+
+        hint = ttk.LabelFrame(tab, text="说明")
+        hint.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(
+            hint,
+            text=(
+                "手眼标定 (AprilTag):先启动标定节点,然后在多个机械臂位姿下依次 Capture,"
+                "样本数 ≥5 后可 Solve 求解。\n"
+                "前置条件:相机已启动(Home 页 Camera + View)、base_link→tool0 TF 就绪、"
+                "标定板在视野内。缺 TF 或未检测到标签时 Capture 会失败并在此处显示原因。\n"
+                "标定板与话题参数可通过 launch 参数 hand_eye_calibrator_command 覆盖。"
+            ),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        node_group = ttk.LabelFrame(tab, text="标定节点")
+        node_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        node_group.columnconfigure(1, weight=1)
+        status_var = tk.StringVar(value="stopped")
+        self.status_vars["hand_eye_calibrator"] = status_var
+        ttk.Label(node_group, text="节点状态", style="State.TLabel").grid(
+            row=0, column=0, sticky="w", padx=8, pady=4
+        )
+        ttk.Label(node_group, textvariable=status_var).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=4
+        )
+        ttk.Button(
+            node_group,
+            text="Start",
+            command=lambda: self.node.start_managed_process("hand_eye_calibrator"),
+        ).grid(row=0, column=2, sticky="ew", padx=8, pady=4)
+        ttk.Button(
+            node_group,
+            text="Stop",
+            command=lambda: self.node.stop_managed_process("hand_eye_calibrator"),
+            style="Danger.TButton",
+        ).grid(row=0, column=3, sticky="ew", padx=8, pady=4)
+
+        action_group = ttk.LabelFrame(tab, text="标定操作")
+        action_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for column in range(3):
+            action_group.columnconfigure(column, weight=1)
+        self.hand_eye_action_buttons: dict[str, ttk.Button] = {}
+        for column, (key, label) in enumerate(
+            (
+                ("capture", "Capture 采集样本"),
+                ("solve", "Solve 求解标定"),
+                ("reset", "Reset 清空样本"),
+            )
+        ):
+            button = ttk.Button(
+                action_group,
+                text=label,
+                command=lambda name=key: self.node.call_hand_eye_service(name),
+            )
+            button.grid(row=0, column=column, sticky="ew", padx=8, pady=6)
+            self.hand_eye_action_buttons[key] = button
+
+        result_group = ttk.LabelFrame(tab, text="最近结果")
+        result_group.grid(row=3, column=0, sticky="nsew")
+        result_group.rowconfigure(0, weight=1)
+        result_group.columnconfigure(0, weight=1)
+        self.hand_eye_result_text = tk.Text(result_group, height=6, state="disabled", wrap="word")
+        self.hand_eye_result_text.grid(row=0, column=0, sticky="nsew", padx=8, pady=6)
+
+        convert_group = ttk.LabelFrame(tab, text="Convert 标定结果 → 外参配置")
+        convert_group.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        convert_group.columnconfigure(1, weight=1)
+        self.convert_source_var = tk.StringVar(value="未选择标定 JSON（log/calibration/hand_eye/*.json）")
+        ttk.Label(convert_group, textvariable=self.convert_source_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4
+        )
+        self.convert_result_var = tk.StringVar(value="")
+        ttk.Label(convert_group, textvariable=self.convert_result_var, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=4
+        )
+        ttk.Button(
+            convert_group, text="选择标定 JSON", command=self._pick_calibration_json
+        ).grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 8))
+        ttk.Button(
+            convert_group,
+            text="Save as Config",
+            command=self._save_converted_extrinsics,
+            style="Primary.TButton",
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        self.converted_result: dict | None = None
+
+    def _build_camera_cal_tab(self) -> None:
+        tab = self._add_scrollable_tab("Camera Cal")
+        tab.columnconfigure(0, weight=1)
+
+        hint = ttk.LabelFrame(tab, text="说明")
+        hint.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(
+            hint,
+            text=(
+                "相机内参标定(采集阶段):复用现有 AprilTag 手眼标定板(A3, tagStandard41h12),"
+                "采集 ≥20 张覆盖画面四角+中心、多倾角、多距离的清晰图像。\n"
+                "采集后离线用 cv2.calibrateCamera 求解 K 与畸变(本页只负责存图,不求解)。\n"
+                "前置条件:Start Camera 启动相机;板静止、无运动模糊;尽量整板入画。"
+            ),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        board_group = ttk.LabelFrame(tab, text="标定板参数(复用手眼标定板)")
+        board_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for column in range(6):
+            board_group.columnconfigure(column, weight=1)
+        ttk.Label(board_group, text="板参考图").grid(
+            row=0, column=0, sticky="w", padx=8, pady=4
+        )
+        ttk.Label(board_group, textvariable=self.intrinsic_board_path_var).grid(
+            row=0, column=1, columnspan=4, sticky="ew", padx=8, pady=4
+        )
+        ttk.Button(
+            board_group, text="Browse", command=self._intrinsic_browse_board
+        ).grid(row=0, column=5, sticky="ew", padx=8, pady=4)
+        fields = (
+            ("宽 m", self.intrinsic_board_w_var),
+            ("高 m", self.intrinsic_board_h_var),
+            ("tag 边长 m", self.intrinsic_tag_size_var),
+            ("tag 间距 m", self.intrinsic_tag_pitch_var),
+        )
+        for column, (label, var) in enumerate(fields):
+            ttk.Label(board_group, text=label).grid(
+                row=1, column=column * 2, sticky="w", padx=(8, 2), pady=4
+            )
+            ttk.Entry(board_group, textvariable=var, width=12).grid(
+                row=1, column=column * 2 + 1, sticky="ew", padx=(2, 8), pady=4
+            )
+
+        dir_group = ttk.LabelFrame(tab, text="保存目录")
+        dir_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        dir_group.columnconfigure(0, weight=1)
+        ttk.Entry(dir_group, textvariable=self.intrinsic_cal_dir_var).grid(
+            row=0, column=0, sticky="ew", padx=8, pady=4
+        )
+        ttk.Button(dir_group, text="Browse", command=self._intrinsic_browse_dir).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=4
+        )
+
+        action_group = ttk.LabelFrame(tab, text="采集操作")
+        action_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        for column in range(5):
+            action_group.columnconfigure(column, weight=1)
+        actions = (
+            ("Start Camera", lambda: self.node.start_managed_process("camera"), None),
+            ("Start Viewer", lambda: self.node.start_managed_process("viewer"), None),
+            ("Capture 存图", self._intrinsic_capture, "Primary.TButton"),
+            ("Delete Last", self._intrinsic_delete_last, None),
+            ("Clear 清空", self._intrinsic_clear, "Danger.TButton"),
+        )
+        for column, (text, command, style) in enumerate(actions):
+            button = ttk.Button(action_group, text=text, command=command)
+            if style:
+                button.configure(style=style)
+            button.grid(row=0, column=column, sticky="ew", padx=8, pady=6)
+
+        status_group = ttk.LabelFrame(tab, text="采集状态")
+        status_group.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        status_group.columnconfigure(0, weight=1)
+        ttk.Label(status_group, text="已采集", style="State.TLabel").grid(
+            row=0, column=0, sticky="w", padx=8, pady=4
+        )
+        ttk.Label(status_group, textvariable=self.intrinsic_count_var).grid(
+            row=0, column=1, sticky="w", padx=8, pady=4
+        )
+        ttk.Label(status_group, textvariable=self.intrinsic_last_var, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=8, pady=4
+        )
+        self._refresh_intrinsic_status()
+
+    def _intrinsic_worker(self, call, on_done) -> None:
+        def runner() -> None:
+            try:
+                result = call()
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                result, error = None, str(exc)
+            self.root.after(0, lambda: on_done(result, error))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _intrinsic_board_params_from_ui(self) -> dict:
+        try:
+            width = float(self.intrinsic_board_w_var.get())
+            height = float(self.intrinsic_board_h_var.get())
+            tag_size = float(self.intrinsic_tag_size_var.get())
+            tag_pitch = float(self.intrinsic_tag_pitch_var.get())
+        except ValueError as exc:
+            raise ValueError(f"标定板参数必须是数字: {exc}") from exc
+        if not (0.01 <= width <= 2.0 and 0.01 <= height <= 2.0):
+            raise ValueError(f"板尺寸超出合理范围: {width} x {height} m")
+        if not (0.005 <= tag_size <= 0.5 and tag_size <= tag_pitch <= 1.0):
+            raise ValueError(f"tag 尺寸/间距不合理: tag={tag_size} pitch={tag_pitch} m")
+        if not self.intrinsic_board_path_var.get().strip():
+            raise ValueError("板参考图路径为空,请先选择标定板参考图")
+        return {
+            "board_image_path": self.intrinsic_board_path_var.get().strip(),
+            "board_width_m": width,
+            "board_height_m": height,
+            "tag_size_m": tag_size,
+            "tag_pitch_m": tag_pitch,
+            "tag_family": "tagStandard41h12",
+        }
+
+    def _refresh_intrinsic_status(self) -> None:
+        self.intrinsic_count_var.set(
+            f"{self.node.intrinsic_capture_count(self.intrinsic_cal_dir_var.get())} 张"
+        )
+
+    def _intrinsic_capture(self) -> None:
+        try:
+            params = self._intrinsic_board_params_from_ui()
+        except ValueError as exc:
+            messagebox.showerror("标定板参数错误", str(exc))
+            return
+        self._intrinsic_worker(
+            lambda: self.node.capture_intrinsic_image(params, self.intrinsic_cal_dir_var.get()),
+            self._on_intrinsic_capture_done,
+        )
+
+    def _intrinsic_delete_last(self) -> None:
+        self._intrinsic_worker(
+            lambda: self.node.delete_last_intrinsic_capture(self.intrinsic_cal_dir_var.get()),
+            self._on_intrinsic_delete_done,
+        )
+
+    def _intrinsic_clear(self) -> None:
+        if not messagebox.askyesno(
+            "清空采集",
+            f"删除该目录下所有 frame_*.png 与 manifest?\n\n{self.intrinsic_cal_dir_var.get()}",
+        ):
+            return
+        self._intrinsic_worker(
+            lambda: self.node.clear_intrinsic_captures(self.intrinsic_cal_dir_var.get()),
+            self._on_intrinsic_clear_done,
+        )
+
+    def _on_intrinsic_capture_done(self, result, error) -> None:
+        self._refresh_intrinsic_status()
+        if error is not None:
+            messagebox.showerror("采集失败", error)
+            return
+        if result is None:
+            return  # node 已通过 _status 提示原因(无帧/编码不符等)
+        self.intrinsic_last_var.set(f"已保存: {Path(result).name}")
+
+    def _on_intrinsic_delete_done(self, result, error) -> None:
+        self._refresh_intrinsic_status()
+        if error is not None:
+            messagebox.showerror("删除失败", error)
+        elif result is not None:
+            self.intrinsic_last_var.set(f"已删除: {Path(result).name}")
+
+    def _on_intrinsic_clear_done(self, result, error) -> None:
+        self._refresh_intrinsic_status()
+        if error is not None:
+            messagebox.showerror("清空失败", error)
+        else:
+            self.intrinsic_last_var.set(f"已清空 {result} 张图像")
+
+    def _intrinsic_browse_board(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择标定板参考图",
+            initialfile=self.intrinsic_board_path_var.get(),
+            filetypes=(("PNG 图像", "*.png"), ("所有文件", "*")),
+        )
+        if path:
+            self.intrinsic_board_path_var.set(path)
+
+    def _intrinsic_browse_dir(self) -> None:
+        path = filedialog.askdirectory(
+            title="选择采集保存目录",
+            initialdir=os.path.abspath(self.intrinsic_cal_dir_var.get()),
+        )
+        if path:
+            self.intrinsic_cal_dir_var.set(path)
+
     def _build_config_tab(self) -> None:
         tab = self._add_scrollable_tab("Configure")
         tab.columnconfigure(0, weight=1)
@@ -4757,6 +5687,46 @@ class TeachPanelApp:
         ).grid(
             row=1, column=0, sticky="w", padx=6, pady=4
         )
+
+        hand_eye = ttk.LabelFrame(tab, text="Hand-Eye Extrinsics (当前真实生效外参)")
+        hand_eye.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        hand_eye.columnconfigure(1, weight=1)
+        self.hand_eye_frame = hand_eye
+        current_xyz = CURRENT_HAND_EYE_XYZ
+        current_rpy = CURRENT_HAND_EYE_RPY
+        ttk.Label(
+            hand_eye,
+            text=(
+                f"{CURRENT_HAND_EYE_PARENT_FRAME} -> {CURRENT_HAND_EYE_CHILD_FRAME}\n"
+                f"xyz=[{current_xyz[0]:.4f}, {current_xyz[1]:.4f}, {current_xyz[2]:.4f}]  "
+                f"rpy=[{current_rpy[0]:.4f}, {current_rpy[1]:.4f}, {current_rpy[2]:.4f}]"
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        self.hand_eye_status_var = tk.StringVar(
+            value="未保存为 config（仅 gemini335.launch.py 默认值）"
+        )
+        ttk.Label(hand_eye, textvariable=self.hand_eye_status_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4
+        )
+        self.hand_eye_combo_var = tk.StringVar(value="")
+        self.hand_eye_combo = ttk.Combobox(
+            hand_eye, textvariable=self.hand_eye_combo_var, state="readonly", width=46
+        )
+        self.hand_eye_combo.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=4)
+        ttk.Button(
+            hand_eye, text="Refresh", command=self._refresh_hand_eye_extrinsics_list
+        ).grid(row=2, column=2, sticky="ew", padx=6, pady=4)
+        ttk.Button(
+            hand_eye,
+            text="Apply 写入 launch 默认值",
+            command=self._apply_hand_eye_extrinsics,
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(4, 2))
+        ttk.Button(
+            hand_eye, text="Save Current as Config", command=self._save_current_hand_eye_config
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        self.hand_eye_entries: list[dict] = []
+        self._refresh_hand_eye_extrinsics_list()
 
     def _build_log_tab(self) -> None:
         tab = self._add_scrollable_tab("Log")
@@ -4983,7 +5953,24 @@ class TeachPanelApp:
         self._refresh_move_joint_values()
         self._refresh_joint_tree()
         self._refresh_logs()
+        self._refresh_hand_eye(snapshot)
         self.root.after(100, self._refresh)
+
+    def _refresh_hand_eye(self, snapshot: dict[str, str]) -> None:
+        buttons = getattr(self, "hand_eye_action_buttons", None)
+        if buttons is not None:
+            busy = snapshot.get("hand_eye_busy", "idle") == "busy"
+            for button in buttons.values():
+                button.configure(state="disabled" if busy else "normal")
+        text = getattr(self, "hand_eye_result_text", None)
+        if text is not None:
+            result = snapshot.get("hand_eye_last_result", "no result yet")
+            if getattr(self, "_hand_eye_result_shown", None) != result:
+                self._hand_eye_result_shown = result
+                text.configure(state="normal")
+                text.delete("1.0", tk.END)
+                text.insert(tk.END, result)
+                text.configure(state="disabled")
 
     def _refresh_move_joint_values(self) -> None:
         joints = self.node.joint_snapshot()
@@ -5201,6 +6188,159 @@ class TeachPanelApp:
                 )
         except Exception as exc:
             messagebox.showerror("Load Config", str(exc))
+
+    def _save_current_hand_eye_config(self) -> None:
+        try:
+            path = self.node.save_current_hand_eye_config()
+        except Exception as exc:
+            messagebox.showerror("Hand-Eye Extrinsics", f"save failed: {exc}")
+            return
+        self._refresh_hand_eye_extrinsics_list()
+        self.hand_eye_status_var.set(f"saved: {path.name}（已设为 current）")
+        messagebox.showinfo("Hand-Eye Extrinsics", f"已保存当前生效外参为 config:\n{path}")
+
+    def _refresh_hand_eye_extrinsics_list(self) -> None:
+        entries = self.node.list_hand_eye_extrinsics()
+        self.hand_eye_entries = entries
+        labels = []
+        for entry in entries:
+            payload = entry["payload"]
+            source = str(payload.get("source_json", ""))
+            error = payload.get("mean_reprojection_error_px")
+            detail = f"  err={error:.2f}px" if isinstance(error, (int, float)) else ""
+            labels.append(f"{entry['name']}{detail}  [{source}]")
+        self.hand_eye_combo_var.set("")
+        self.hand_eye_combo["values"] = labels
+        current = self.node.current_hand_eye_config_name()
+        if current:
+            self.hand_eye_status_var.set(f"current: {current}")
+        else:
+            self.hand_eye_status_var.set("未保存为 config（仅 gemini335.launch.py 默认值）")
+
+    def _apply_hand_eye_extrinsics(self) -> None:
+        selection = self.hand_eye_combo_var.get()
+        if not selection or not self.hand_eye_entries:
+            messagebox.showwarning("Hand-Eye Extrinsics", "请先选择一个外参配置。")
+            return
+        index = list(self.hand_eye_combo["values"]).index(selection)
+        filename = self.hand_eye_entries[index]["filename"]
+        # 软告警质量门禁：优先追溯 source_json 标定文件做全量校验，否则对位姿与当前生效值比偏差
+        payload = self.node.read_hand_eye_extrinsics(filename)
+        quality = None
+        source_json = (payload or {}).get("source_json")
+        if source_json:
+            src = Path(source_json).expanduser()
+            if src.exists():
+                try:
+                    calibration = json.loads(src.read_text(encoding="utf-8"))
+                    quality = check_calibration(calibration)
+                except (OSError, json.JSONDecodeError, ValueError):
+                    quality = None
+        if quality is None and payload and payload.get("xyz") and payload.get("rpy"):
+            quality = check_pose(payload["xyz"], payload["rpy"], CURRENT_HAND_EYE_XYZ, CURRENT_HAND_EYE_RPY)
+        if quality and quality["has_fail"]:
+            if not messagebox.askyesno(
+                "Hand-Eye Extrinsics",
+                "质量门禁：以下指标不达标（建议拦截）：\n\n"
+                f"{_quality_summary_lines(quality)}\n\n"
+                "仍要改写 camera_optical_* 默认值吗？",
+                icon="warning",
+            ):
+                return
+        elif quality and quality["has_warn"]:
+            messagebox.showwarning(
+                "Hand-Eye Extrinsics",
+                "质量提示（警告项，不阻止应用）：\n\n" + _quality_summary_lines(quality),
+            )
+        if not messagebox.askyesno(
+            "Hand-Eye Extrinsics",
+            "将改写 gemini335.launch.py / teach_panel.launch.py / teach_panel.py 中 "
+            "camera_optical_* 默认值（改写前备份 .bak），下次启动生效。继续？",
+        ):
+            return
+        try:
+            result = self.node.apply_hand_eye_extrinsics(filename)
+        except Exception as exc:
+            messagebox.showerror("Hand-Eye Extrinsics", f"apply failed: {exc}")
+            return
+        self.hand_eye_status_var.set(f"applied: {filename}（重启生效）")
+        details = "\n".join(f"{path}: {text}" for path, text in result["results"].items())
+        messagebox.showinfo(
+            "Hand-Eye Extrinsics",
+            f"已应用 {filename}:\n{details}\n\n重启 teach_panel 后生效。",
+        )
+
+    def _pick_calibration_json(self) -> None:
+        initial = self.node._workspace_path("log/calibration/hand_eye")
+        path = filedialog.askopenfilename(
+            title="选择手眼标定结果 JSON",
+            initialdir=str(initial if initial.exists() else self.node.workspace_root),
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            result = self.node.convert_calibration_to_extrinsics(path)
+        except Exception as exc:
+            messagebox.showerror("Convert Hand-Eye", str(exc))
+            return
+        self.converted_result = result
+        self.convert_source_var.set(f"source: {path}")
+        xyz, rpy = result["xyz"], result["rpy"]
+        diff = result["diff_vs_current"]
+        error = result["mean_reprojection_error_px"]
+        error_text = f"{error:.2f}px" if error else "n/a"
+        quality = result.get("quality")
+        q_status = "FAIL" if (quality and quality["has_fail"]) else ("WARN" if (quality and quality["has_warn"]) else "PASS")
+        summary = _quality_summary_lines(quality) if quality else "  无质量报告"
+        self.convert_result_var.set(
+            f"换算: {CURRENT_HAND_EYE_PARENT_FRAME} -> {CURRENT_HAND_EYE_CHILD_FRAME}\n"
+            f"xyz=[{xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}]  "
+            f"rpy=[{rpy[0]:.4f}, {rpy[1]:.4f}, {rpy[2]:.4f}]\n"
+            f"质量: {result['sample_count']} 样本, err={error_text}, method={result['selected_method']}, "
+            f"门禁: {q_status}\n"
+            f"{summary}\n"
+            f"与当前生效值差异: xyz=[{diff[0]:+.3f}, {diff[1]:+.3f}, {diff[2]:+.3f}] "
+            f"rpy=[{diff[3]:+.3f}, {diff[4]:+.3f}, {diff[5]:+.3f}]"
+        )
+
+    def _save_converted_extrinsics(self) -> None:
+        result = self.converted_result
+        if result is None:
+            messagebox.showwarning("Convert Hand-Eye", "请先选择标定 JSON。")
+            return
+        name = str(result["payload"]["name"])
+        target = self.node.hand_eye_extrinsics_dir() / f"{name}.json"
+        quality = result.get("quality")
+        if quality and quality["has_fail"]:
+            if not messagebox.askyesno(
+                "Convert Hand-Eye",
+                "质量门禁：以下指标不达标（建议拦截）：\n\n"
+                f"{_quality_summary_lines(quality)}\n\n"
+                "仍要保存为 config 并设为 current 吗？",
+                icon="warning",
+            ):
+                return
+        elif quality and quality["has_warn"]:
+            messagebox.showwarning(
+                "Convert Hand-Eye",
+                "质量提示（警告项，不阻止保存）：\n\n" + _quality_summary_lines(quality),
+            )
+        if target.exists() and not messagebox.askyesno(
+            "Convert Hand-Eye", f"{target.name} 已存在，覆盖？"
+        ):
+            return
+        try:
+            path = self.node.save_hand_eye_extrinsics_payload(result["payload"], set_current=True)
+        except Exception as exc:
+            messagebox.showerror("Convert Hand-Eye", f"save failed: {exc}")
+            return
+        self._refresh_hand_eye_extrinsics_list()
+        self.hand_eye_status_var.set(f"current: {path.name}（已设为 current）")
+        messagebox.showinfo(
+            "Convert Hand-Eye",
+            f"已保存为 config:\n{path}\n\n可在 Configure 页 Apply 写入 launch 默认值。",
+        )
 
     def _move_to_joint_targets(self) -> None:
         try:

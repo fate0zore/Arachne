@@ -42,6 +42,7 @@ def generate_launch_description():
         ),
         launch_arguments={
             "color_device": LaunchConfiguration("camera_color_device"),
+            "color_capture_mode": LaunchConfiguration("camera_color_capture_mode"),
             "color_fourcc": LaunchConfiguration("camera_color_fourcc"),
             "depth_device": LaunchConfiguration("camera_depth_device"),
             "with_color_view": LaunchConfiguration("camera_with_color_view"),
@@ -369,6 +370,7 @@ def generate_launch_description():
                 "grasp_server_command": LaunchConfiguration("grasp_server_command"),
                 "cleanup_server_command": LaunchConfiguration("cleanup_server_command"),
                 "step_cleanup_server_command": LaunchConfiguration("step_cleanup_server_command"),
+                "hand_eye_calibrator_command": LaunchConfiguration("hand_eye_calibrator_command"),
                 "grasp_task_state_topic": LaunchConfiguration("grasp_task_state_topic"),
                 "grasp_task_start_service": LaunchConfiguration("grasp_task_start_service"),
                 "grasp_task_stop_service": LaunchConfiguration("grasp_task_stop_service"),
@@ -418,6 +420,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("with_camera", default_value="false"),
             DeclareLaunchArgument("camera_color_device", default_value="/dev/video6"),
+            DeclareLaunchArgument("camera_color_capture_mode", default_value="v4l2-ctl"),
             DeclareLaunchArgument("camera_color_fourcc", default_value="YUYV"),
             DeclareLaunchArgument("camera_depth_device", default_value="/dev/video0"),
             DeclareLaunchArgument("camera_with_color_view", default_value="false"),
@@ -594,9 +597,10 @@ def generate_launch_description():
                     "depth_width:=640 depth_height:=480 depth_fps:=15.0 "
                     "color_v4l2_controls:=brightness=20,exposure_auto=0,exposure_absolute=45,gain=0 "
                     "camera_optical_x:=0.0201 camera_optical_y:=0.0 "
-                    "camera_optical_z:=0.2196 camera_optical_roll:=0.196 "
-                    "camera_optical_pitch:=-0.024 camera_optical_yaw:=-1.570796327 "
-                    "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV"
+                    "camera_optical_z:=0.05 camera_optical_roll:=0.0 "
+                    "camera_optical_pitch:=0.0 camera_optical_yaw:=-1.570796327 "
+                    "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV "
+                    "color_capture_mode:=v4l2-ctl"
                 ),
             ),
             DeclareLaunchArgument(
@@ -693,6 +697,10 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "step_cleanup_server_command",
                 default_value="ros2 launch arachne_operator step_cleanup_demo.launch.py",
+            ),
+            DeclareLaunchArgument(
+                "hand_eye_calibrator_command",
+                default_value="ros2 run arachne_operator apriltag_hand_eye_calibrator",
             ),
             DeclareLaunchArgument("grasp_task_state_topic", default_value="/arachne/grasp_task/state"),
             DeclareLaunchArgument("grasp_task_start_service", default_value="/arachne/grasp_task/start"),

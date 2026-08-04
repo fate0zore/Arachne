@@ -31,9 +31,9 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("camera_parent_frame", default_value="ee_camera_link"),
             DeclareLaunchArgument("camera_optical_x", default_value="0.0201"),
             DeclareLaunchArgument("camera_optical_y", default_value="0.0"),
-            DeclareLaunchArgument("camera_optical_z", default_value="0.2196"),
-            DeclareLaunchArgument("camera_optical_roll", default_value="0.196"),
-            DeclareLaunchArgument("camera_optical_pitch", default_value="-0.024"),
+            DeclareLaunchArgument("camera_optical_z", default_value="0.05"),
+            DeclareLaunchArgument("camera_optical_roll", default_value="0.0"),
+            DeclareLaunchArgument("camera_optical_pitch", default_value="0.0"),
             DeclareLaunchArgument("camera_optical_yaw", default_value="-1.570796327"),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

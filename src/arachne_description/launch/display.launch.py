@@ -334,9 +334,9 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_depth_frame", default_value="camera_depth_optical_frame"),
             DeclareLaunchArgument("camera_optical_x", default_value="0.0201"),
             DeclareLaunchArgument("camera_optical_y", default_value="0.0"),
-            DeclareLaunchArgument("camera_optical_z", default_value="0.2196"),
-            DeclareLaunchArgument("camera_optical_roll", default_value="0.196"),
-            DeclareLaunchArgument("camera_optical_pitch", default_value="-0.024"),
+            DeclareLaunchArgument("camera_optical_z", default_value="0.05"),
+            DeclareLaunchArgument("camera_optical_roll", default_value="0.0"),
+            DeclareLaunchArgument("camera_optical_pitch", default_value="0.0"),
             DeclareLaunchArgument("camera_optical_yaw", default_value="-1.570796327"),
             DeclareLaunchArgument("joint_state_publish_rate", default_value="80.0"),
             DeclareLaunchArgument(
