@@ -647,7 +647,7 @@ def generate_launch_description():
                     "ros2 launch arachne_operator grasp_task_server.launch.py "
                     "execute_real:=true confirm_execute_real:=true with_rviz:=false "
                     "confidence:=0.03 "
-                    "grasp_base_offset:=-0.23,0.01,0.16 "
+                    "grasp_base_offset:=0.03,0.0,0.0 "
                     "real_fixed_post_grasp:=true "
                     "release_point:=basket_a "
                     "release_point_b_joints:=-1.407594293659515,0.07478614140534845,2.611345219296526,1.0028015483718502,1.6581842928233566,0.8873273897703009 "

@@ -391,7 +391,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-scale", type=float, default=0.001, help=hidden)
     parser.add_argument("--min-depth", type=float, default=0.12, help=hidden)
     parser.add_argument("--max-depth", type=float, default=2.5, help=hidden)
-    parser.add_argument("--depth-percentile", type=float, default=35.0, help=hidden)
+    parser.add_argument("--depth-percentile", type=float, default=50.0, help=hidden)
     parser.add_argument("--depth-band", type=float, default=0.08, help=hidden)
     parser.add_argument("--yolo-depth-filter", action=argparse.BooleanOptionalAction, default=False, help=hidden)
     parser.add_argument("--yolo-depth-min-base-z", type=float, default=-0.20, help=hidden)
@@ -3533,10 +3533,21 @@ class GraspPreviewNode(Node):
             detection, depth_m, dw, dh, cw, ch
         )
         axis_done = time.monotonic()
-        arr = np.asarray(roi_points, dtype=np.float32)
-        grasp_x, grasp_y, grasp_z = np.median(arr, axis=0).astype(float)
+        # Grasp target at the ROI point-cloud median (object geometry center).
+        # Do NOT project the bbox center pixel: for low/flat objects seen from
+        # above-front (e.g. a lying bottle), the visible contour is asymmetric
+        # (near end-face visible, far end-face occluded), so the bbox center
+        # lies on the near side of the object and the projected grasp would
+        # land on its near end.
+        roi_arr = np.asarray(roi_points, dtype=np.float64)
+        grasp_x, grasp_y, grasp_z = (float(v) for v in np.median(roi_arr, axis=0))
 
-        grasp_z = max(grasp_z - float(self.args.grasp_standoff), self.args.min_depth)
+        # NOTE: do NOT apply grasp_standoff here. This z is along the camera
+        # optical axis (roughly horizontal, tilted down); subtracting standoff
+        # would pull the target toward the AGV side by ~3cm for top-down grasps,
+        # landing on the near edge of the object. The vertical "standoff from
+        # surface" compensation is done in base frame via grasp_final_z_offset_m.
+        grasp_z = max(grasp_z, self.args.min_depth)
         grasp = (grasp_x, grasp_y, grasp_z)
         pregrasp = (
             grasp_x,

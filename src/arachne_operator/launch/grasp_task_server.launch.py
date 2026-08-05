@@ -57,7 +57,7 @@ def generate_launch_description():
             DeclareLaunchArgument("prefer_aubo_move_joint_action", default_value="false"),
             DeclareLaunchArgument("aubo_move_joint_fallback_internal", default_value="false"),
             DeclareLaunchArgument("aubo_move_joint_wait_server_sec", default_value="0.5"),
-            DeclareLaunchArgument("grasp_base_offset", default_value="-0.23,0.01,0.16"),
+            DeclareLaunchArgument("grasp_base_offset", default_value="0.03,0.0,0.0"),
             DeclareLaunchArgument(
                 "extra_args",
                 default_value=(

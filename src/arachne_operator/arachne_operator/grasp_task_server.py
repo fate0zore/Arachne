@@ -142,7 +142,7 @@ class GraspTaskServer(Node):
         self.declare_parameter("prefer_aubo_move_joint_action", False)
         self.declare_parameter("aubo_move_joint_fallback_internal", False)
         self.declare_parameter("aubo_move_joint_wait_server_sec", 0.5)
-        self.declare_parameter("grasp_base_offset", "-0.23,0.01,0.16")
+        self.declare_parameter("grasp_base_offset", "0.03,0.0,0.0")
         self.declare_parameter(
             "extra_args",
             "--planner-backend local --planning-key-waypoints grasp --vertical-approach --no-lock-grasp-orientation --tool-orientation-limit-deg 45 --grasp-orientation-yaw-offsets-deg 0 --grasp-orientation-tilt-offsets-deg 0,8,-8 --local-position-tolerance 0.010 --local-orientation-tolerance 0.50 --local-planning-timeout-sec 2.0 --local-ik-max-iterations 90 --real-gripper-require-capture --real-sdk-semantic-targets-only --real-sdk-max-targets 6",

@@ -627,7 +627,7 @@ class TeachPanelNode(Node):
                 "ros2 launch arachne_operator grasp_task_server.launch.py "
                 "execute_real:=true confirm_execute_real:=true with_rviz:=false "
                 "confidence:=0.03 "
-                "grasp_base_offset:=-0.23,0.01,0.16 "
+                "grasp_base_offset:=0.03,0.0,0.0 "
                 "real_fixed_post_grasp:=true "
                 "real_fixed_search_joints:=-1.611779,-0.457910,1.071527,-0.044520,1.575231,0.771459 "
                 "real_sdk_move_speed:=0.18 "
