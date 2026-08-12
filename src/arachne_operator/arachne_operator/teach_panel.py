@@ -36,6 +36,7 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from viewpoint_planner_msgs.srv import PlanViewpoints
 
 from arachne_operator.control_owner import (
     DEFAULT_AUBO_CONTROL_OWNER_PATH,
@@ -94,6 +95,8 @@ DEFAULT_AUBO_TEACH_FLAG_PATH = "/tmp/arachne_aubo_teach_mode"
 GRIPPER_PRESET_COMMANDS = ("12000", "9000", "6000")
 GRIPPER_CUSTOM_MIN = 0
 GRIPPER_CUSTOM_MAX = 18720
+# 弹窗允许的最大采点数量：防误填击穿 IK 时间预算 / RViz Marker 数量
+MAX_VIEWPOINT_COUNT = 128
 MANAGED_SERVICE_COMMAND_PARAMS = {
     "camera": "camera_command",
     "depth_pointcloud": "depth_pointcloud_command",
@@ -104,11 +107,13 @@ MANAGED_SERVICE_COMMAND_PARAMS = {
     "cleanup_server": "cleanup_server_command",
     "step_cleanup_server": "step_cleanup_server_command",
     "hand_eye_calibrator": "hand_eye_calibrator_command",
+    "viewpoint_planner": "viewpoint_planner_command",
 }
 MANAGED_SERVICE_READY_SERVICES = {
     "grasp_server": ("/arachne/grasp_task/status", "/arachne/grasp_task/start"),
     "cleanup_server": ("/arachne/road_cleanup/status", "/arachne/road_cleanup/start"),
     "step_cleanup_server": ("/arachne/step_cleanup/status", "/arachne/step_cleanup/start"),
+    "viewpoint_planner": ("/arachne/viewpoint/plan",),
 }
 MANAGED_SERVICE_READY_TOPICS = {
     "grasp_server": "/arachne/grasp_task/state",
@@ -445,6 +450,90 @@ def _waypoint_from_dict(data: dict) -> TeachWaypoint:
     return TeachWaypoint(**filtered)
 
 
+def _serialize_viewpoint_plan(
+    request: PlanViewpoints.Request, response: PlanViewpoints.Response
+) -> dict:
+    """Serialize a viewpoint plan request/response into plain JSON-ready data.
+
+    Pure function (no ROS/node state) so it can be exercised offline.
+    """
+    viewpoints = []
+    for viewpoint in response.viewpoints:
+        viewpoints.append(
+            {
+                "stamp": {"sec": viewpoint.stamp.sec, "nanosec": viewpoint.stamp.nanosec},
+                "camera_xyz_base": [float(value) for value in viewpoint.camera_xyz_base],
+                "camera_quat_xyzw": [float(value) for value in viewpoint.camera_quat_xyzw],
+                "tool0_xyz_base": [float(value) for value in viewpoint.tool0_xyz_base],
+                "tool0_quat_xyzw": [float(value) for value in viewpoint.tool0_quat_xyzw],
+                "ik_reachable": bool(viewpoint.ik_reachable),
+                "ik_joints": [float(value) for value in viewpoint.ik_joints],
+            }
+        )
+    return {
+        "planning_stamp": datetime.now().isoformat(timespec="milliseconds"),
+        "request": {
+            "target_xyz_base": [float(value) for value in request.target_xyz_base],
+            "strategy": str(request.strategy),
+            "radius_m": float(request.radius_m),
+            "num_viewpoints": int(request.num_viewpoints),
+            "filter_ik_reachable": bool(request.filter_ik_reachable),
+            "up_vector_base": [float(value) for value in request.up_vector_base],
+        },
+        "server_message": str(response.message),
+        "num_viewpoints": len(viewpoints),
+        "ik_reachable_count": sum(1 for viewpoint in response.viewpoints if viewpoint.ik_reachable),
+        "viewpoints": viewpoints,
+    }
+
+
+def _viewpoint_plan_result_path(session_dir: Path) -> Path:
+    """Millisecond-timestamped result file inside the session log directory."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return Path(session_dir) / f"viewpoint_plan_{stamp}.json"
+
+
+def _parse_viewpoint_plan_file(path: Path | str) -> dict:
+    """Parse a viewpoint plan result JSON into renderable row data.
+
+    Pure function (no ROS/node/Tk state) so it can be exercised offline.
+    Each viewpoint row carries `ik_joints_deg` (radians converted to degrees)
+    for direct use by the arm motion entry.
+    """
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("viewpoint plan file must contain a JSON object")
+    if "viewpoints" not in raw or not isinstance(raw["viewpoints"], list):
+        raise KeyError("viewpoint plan file missing 'viewpoints' list")
+    viewpoints = []
+    for index, entry in enumerate(raw["viewpoints"]):
+        if not isinstance(entry, dict):
+            raise ValueError(f"viewpoint {index}: expected an object")
+        ik_joints_rad = [float(value) for value in entry.get("ik_joints", [])]
+        if len(ik_joints_rad) != 6:
+            raise ValueError(f"viewpoint {index}: ik_joints must have 6 values")
+        camera = [float(value) for value in entry.get("camera_xyz_base", [])]
+        tool0 = [float(value) for value in entry.get("tool0_xyz_base", [])]
+        if len(camera) != 3 or len(tool0) != 3:
+            raise ValueError(f"viewpoint {index}: xyz arrays must have 3 values")
+        viewpoints.append(
+            {
+                "ik_reachable": bool(entry.get("ik_reachable", False)),
+                "camera_xyz_base": camera,
+                "tool0_xyz_base": tool0,
+                "ik_joints_rad": ik_joints_rad,
+                "ik_joints_deg": [math.degrees(value) for value in ik_joints_rad],
+            }
+        )
+    return {
+        "planning_stamp": str(raw.get("planning_stamp", "")),
+        "request": raw.get("request", {}),
+        "num_viewpoints": len(viewpoints),
+        "ik_reachable_count": sum(1 for row in viewpoints if row["ik_reachable"]),
+        "viewpoints": viewpoints,
+    }
+
+
 class TeachPanelNode(Node):
     def __init__(self) -> None:
         super().__init__("arachne_teach_panel")
@@ -549,6 +638,14 @@ class TeachPanelNode(Node):
         self.declare_parameter("teach_config_path", DEFAULT_TEACH_CONFIG_PATH)
         self.declare_parameter("teach_config_autoload", True)
         self.declare_parameter("hand_eye_extrinsics_dir", DEFAULT_HAND_EYE_EXTRINSICS_DIR)
+        self.declare_parameter("viewpoint_plan_service", "/arachne/viewpoint/plan")
+        self.declare_parameter("viewpoint_plan_radius_m", 0.5)
+        self.declare_parameter("viewpoint_plan_num_viewpoints", 32)
+        self.declare_parameter("viewpoint_plan_filter_ik", True)
+        # Service-call timeout: IK filtering of unreachable targets can take
+        # tens of seconds, so the panel waits longer than the default 20 s.
+        self.declare_parameter("viewpoint_plan_service_timeout_sec", 45.0)
+        self.declare_parameter("taco_instances_topic", "/arachne/perception/taco_instances")
         self.declare_parameter("camera_image_topic", "/camera/color/image_raw")
         self.declare_parameter("intrinsic_cal_dir", "recordings/calibration/intrinsics")
         # 复用现有 AprilTag 手眼标定板(与 apriltag_hand_eye_calibrator 默认一致)
@@ -679,6 +776,10 @@ class TeachPanelNode(Node):
         self.declare_parameter(
             "hand_eye_calibrator_command",
             "ros2 run arachne_operator apriltag_hand_eye_calibrator",
+        )
+        self.declare_parameter(
+            "viewpoint_planner_command",
+            "ros2 launch viewpoint_planner viewpoint_planner.launch.py",
         )
         self.declare_parameter("grasp_task_state_topic", "/arachne/grasp_task/state")
         self.declare_parameter("grasp_task_start_service", "/arachne/grasp_task/start")
@@ -815,6 +916,10 @@ class TeachPanelNode(Node):
                 Trigger, str(self.get_parameter("hand_eye_reset_service").value)
             ),
         }
+        self.viewpoint_plan_client = self.create_client(
+            PlanViewpoints,
+            str(self.get_parameter("viewpoint_plan_service").value),
+        )
 
         self.create_subscription(Odometry, odom_topic, self._odom_callback, 10)
         self.create_subscription(JointState, joint_states_topic, self._joint_state_callback, 10)
@@ -839,6 +944,12 @@ class TeachPanelNode(Node):
             String,
             str(self.get_parameter("step_cleanup_state_topic").value),
             self._step_cleanup_state_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("taco_instances_topic").value),
+            self._taco_instances_cb,
             10,
         )
         self.create_subscription(
@@ -879,6 +990,11 @@ class TeachPanelNode(Node):
         }
         self.hand_eye_busy = False  # 手眼标定服务调用期间置位,避免并发触发
         self.hand_eye_last_result = "no result yet"
+        self.latest_detection_xyz: tuple[float, float, float] | None = None
+        # 弹窗上次输入的采样参数：仅本次会话生效（重启后回落节点参数默认值）
+        self._viewpoint_plan_target_xyz: tuple[float, float, float] | None = None
+        self._viewpoint_plan_radius_m: float | None = None
+        self._viewpoint_plan_num_viewpoints: int | None = None
         self.intrinsic_latest_image: Image | None = None  # Camera Cal 最近一帧(bgr8)
         self.intrinsic_busy = False  # 采集文件操作期间置位,避免并发捕获/删除互相覆盖
         self.intrinsic_lock = threading.Lock()  # 串行化 capture/delete/clear 的计数与 manifest 读写
@@ -1193,9 +1309,15 @@ class TeachPanelNode(Node):
                 "grasp_server": managed["grasp_server"],
                 "cleanup_server": managed["cleanup_server"],
                 "step_cleanup_server": managed["step_cleanup_server"],
+                "viewpoint_planner": managed["viewpoint_planner"],
                 "hand_eye_calibrator": managed["hand_eye_calibrator"],
                 "hand_eye_busy": "busy" if self.hand_eye_busy else "idle",
                 "hand_eye_last_result": self.hand_eye_last_result,
+                "latest_detection_xyz": (
+                    "%.3f %.3f %.3f" % self.latest_detection_xyz
+                    if self.latest_detection_xyz is not None
+                    else "none"
+                ),
                 "log_dir": str(self.runtime_log_dir),
                 **self.hardware_status,
             }
@@ -2047,6 +2169,18 @@ class TeachPanelNode(Node):
         self._status(f"aubo teach_off timeout before replay: {status}", warn=True)
         return False
 
+    def _taco_instances_cb(self, message: String) -> None:
+        """缓存最近一次目标检测的 base_grasp_xyz（base_link 系），供视点规划弹窗预填。"""
+        try:
+            payload = json.loads(message.data)
+            xyz = payload.get("base_grasp_xyz")
+            if not xyz or len(xyz) != 3:
+                return
+            with self.lock:
+                self.latest_detection_xyz = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        except (ValueError, TypeError, AttributeError):
+            return
+
     def call_grasp_task(self, command: str, release_point: str | None = None) -> None:
         command = str(command).strip().lower()
         if command not in self.grasp_task_clients:
@@ -2078,6 +2212,141 @@ class TeachPanelNode(Node):
             self._status(f"step cleanup ignored unknown command: {command}", warn=True)
             return
         self._start_worker(lambda: self._call_step_cleanup_worker(command))
+
+    def call_viewpoint_plan(
+        self,
+        target_xyz: tuple[float, float, float] | None = None,
+        radius_m: float | None = None,
+        num_viewpoints: int | None = None,
+        filter_ik: bool | None = None,
+        on_success=None,
+    ) -> None:
+        self._write_event(
+            "viewpoint_plan_button",
+            "viewpoint plan button requested",
+            target_xyz=list(target_xyz) if target_xyz else [],
+            radius_m=radius_m,
+            num_viewpoints=num_viewpoints,
+            filter_ik=filter_ik,
+        )
+        self._start_worker(
+            lambda: self._call_viewpoint_plan_worker(
+                target_xyz, radius_m, num_viewpoints, filter_ik, on_success
+            )
+        )
+
+    def _call_viewpoint_plan_worker(
+        self,
+        target_xyz: tuple[float, float, float] | None = None,
+        radius_m: float | None = None,
+        num_viewpoints: int | None = None,
+        filter_ik: bool | None = None,
+        on_success=None,
+    ) -> None:
+        client = self.viewpoint_plan_client
+        if target_xyz is None:
+            with self.lock:
+                target_xyz = self.latest_detection_xyz
+        if target_xyz is None:
+            self._status("viewpoint plan: no target; input xyz or wait for detection", warn=True)
+            return
+        service_name = str(self.get_parameter("viewpoint_plan_service").value)
+        if not client.wait_for_service(timeout_sec=4.0):
+            # 节点未启动：自动拉起（复用 managed service 框架），最多等待 30s 就绪。
+            # 注意：graph 级 _services_exist 在本环境与真实可用性可能不一致，
+            # 因此 auto-start 必须跳过 external 检查，直接拉起并轮询 client 可用性。
+            self._status(f"viewpoint planner not running; auto-starting {service_name} ...")
+            self._start_managed_process_worker("viewpoint_planner", skip_external_check=True)
+            deadline = time.monotonic() + 30.0
+            while not client.wait_for_service(timeout_sec=0.5):
+                with self.lock:
+                    process = self.managed_processes.get("viewpoint_planner")
+                if process is not None and process.poll() is not None:
+                    break
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.5)
+            if not client.wait_for_service(timeout_sec=0.5):
+                self._status(
+                    f"viewpoint plan unavailable: {service_name} "
+                    "(auto-start failed; run: ros2 launch viewpoint_planner viewpoint_planner.launch.py)",
+                    warn=True,
+                )
+                return
+            self._status(f"viewpoint planner ready: {service_name}")
+        request = PlanViewpoints.Request()
+        request.target_xyz_base = [float(value) for value in target_xyz]
+        request.strategy = "fibonacci_sphere"
+        request.radius_m = (
+            float(radius_m)
+            if radius_m is not None
+            else float(self.get_parameter("viewpoint_plan_radius_m").value)
+        )
+        request.num_viewpoints = (
+            int(num_viewpoints)
+            if num_viewpoints is not None
+            else int(self.get_parameter("viewpoint_plan_num_viewpoints").value)
+        )
+        request.filter_ik_reachable = (
+            filter_ik
+            if filter_ik is not None
+            else bool(self.get_parameter("viewpoint_plan_filter_ik").value)
+        )
+        try:
+            future = client.call_async(request)
+            if not self._wait_service_future(
+                future, float(self.get_parameter("viewpoint_plan_service_timeout_sec").value)
+            ):
+                self._status(f"viewpoint plan timeout: {service_name}", warn=True)
+                return
+            response = future.result()
+        except Exception as error:  # noqa: BLE001 - 面板回调兜底,不阻塞 UI
+            self._status(f"viewpoint plan error: {error}", warn=True)
+            return
+        if not response.success:
+            self._status(f"viewpoint plan failed: {response.message}", warn=True)
+            return
+        reachable = sum(1 for viewpoint in response.viewpoints if viewpoint.ik_reachable)
+        self._status(
+            f"viewpoint plan ok: {len(response.viewpoints)} viewpoints, "
+            f"{reachable} ik-reachable, "
+            f"target=({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, {target_xyz[2]:.3f})"
+        )
+        result_path = self._write_viewpoint_plan_result(request, response)
+        event_fields: dict[str, Any] = dict(
+            server_message=response.message,
+            num_viewpoints=len(response.viewpoints),
+            ik_reachable=reachable,
+            target_xyz=[float(value) for value in target_xyz],
+        )
+        if result_path is not None:
+            event_fields["result_file"] = str(result_path)
+        else:
+            event_fields["result_file_error"] = "write failed (see node log)"
+        self._write_event("viewpoint_plan_result", "viewpoint plan result", **event_fields)
+        if on_success is not None:
+            try:
+                on_success(result_path)
+            except Exception as error:  # noqa: BLE001 - UI 回调兜底
+                self.get_logger().warning(f"viewpoint plan on_success callback failed: {error}")
+
+    def _write_viewpoint_plan_result(
+        self, request: PlanViewpoints.Request, response: PlanViewpoints.Response
+    ) -> Path | None:
+        """Persist the full viewpoint plan to the session log directory.
+
+        Returns the written path, or None on failure (never blocks the UI).
+        """
+        path = _viewpoint_plan_result_path(self.runtime_log_dir)
+        try:
+            path.write_text(
+                json.dumps(_serialize_viewpoint_plan(request, response), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            self.get_logger().warning(f"viewpoint plan result write failed: {error}")
+            return None
+        return path
 
     def call_hand_eye_service(self, command: str) -> None:
         command = str(command).strip().lower()
@@ -3079,9 +3348,22 @@ class TeachPanelNode(Node):
             manual_stream=True,
         )
 
-    def move_arm_to_joints_degrees(self, degrees: list[float]) -> None:
+    def move_arm_to_joints_degrees(
+        self, degrees: list[float], on_done=None
+    ) -> None:
         self.cancel_event.clear()
-        self._start_worker(lambda: self._move_arm_to_joints_worker(degrees))
+
+        def wrapped() -> None:
+            try:
+                self._move_arm_to_joints_worker(degrees)
+            finally:
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:  # noqa: BLE001 - 回调兜底
+                        pass
+
+        self._start_worker(wrapped)
 
     def home_joints_degrees(self) -> list[float]:
         return _parse_joint_degrees(
@@ -4304,7 +4586,9 @@ class TeachPanelNode(Node):
         for name in list(MANAGED_SERVICE_COMMAND_PARAMS):
             self._stop_managed_process_worker(name, quiet=True)
 
-    def _start_managed_process_worker(self, name: str) -> None:
+    def _start_managed_process_worker(
+        self, name: str, *, skip_external_check: bool = False
+    ) -> None:
         command_param = MANAGED_SERVICE_COMMAND_PARAMS[name]
         command = str(self.get_parameter(command_param).value).strip()
         if name == "grasp_server" and command:
@@ -4326,7 +4610,12 @@ class TeachPanelNode(Node):
             return
         ready_services = MANAGED_SERVICE_READY_SERVICES.get(name, ())
         ready_topic = MANAGED_SERVICE_READY_TOPICS.get(name, "")
-        if ready_services and self._services_exist(ready_services) and self._topic_has_publisher(ready_topic):
+        if (
+            not skip_external_check
+            and ready_services
+            and self._services_exist(ready_services)
+            and (not ready_topic or self._topic_has_publisher(ready_topic))
+        ):
             self._status(f"service {name} already available")
             with self.lock:
                 self.hardware_status[f"Svc:{name}"] = "external"
@@ -4808,6 +5097,7 @@ class TeachPanelApp:
         self.notebook.grid(row=1, column=0, sticky="nsew")
         self._build_home_tab()
         self._build_move_tab()
+        self._build_viewpoint_tab()
         self._build_demo_tab()
         self._build_program_tab()
         self._build_hand_eye_tab()
@@ -4994,6 +5284,7 @@ class TeachPanelApp:
                 ("Grasp Server", lambda: self.node.toggle_managed_process("grasp_server"), None),
                 ("Road Server", lambda: self.node.toggle_managed_process("cleanup_server"), None),
                 ("Step Server", lambda: self.node.toggle_managed_process("step_cleanup_server"), None),
+                ("Viewpoint Plan", self._prompt_viewpoint_plan, None),
             ),
             columns=2,
         )
@@ -5197,6 +5488,315 @@ class TeachPanelApp:
             ttk.Label(frame, textvariable=var, width=23).grid(
                 row=2 + index // 3, column=index % 3, sticky="w", padx=6, pady=2
             )
+
+    def _build_viewpoint_tab(self) -> None:
+        """Viewpoint planning tab: planner service, plan parameters, result list.
+
+        Sections (top to bottom):
+          row 0: planner service start/stop + readiness status
+          row 1: plan parameters (target xyz / radius / count / IK filter) + Plan
+          row 2: planned-viewpoint list loaded from a result JSON, with per-item
+                 manual execution (see _execute_viewpoint_row)
+        """
+        tab = self._add_scrollable_tab("Viewpoint")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        node = self.node
+
+        # 视点规划相关状态（方法内创建并挂到 self，与 _build_move_monitor 同模式）
+        self.viewpoint_xyz_vars = {
+            axis: tk.StringVar(value=f"{default:.3f}")
+            for axis, default in zip(
+                ("x", "y", "z"),
+                node._viewpoint_plan_target_xyz
+                if node._viewpoint_plan_target_xyz is not None
+                else (0.3, 0.0, 0.2),
+            )
+        }
+        radius_default = (
+            node._viewpoint_plan_radius_m
+            if node._viewpoint_plan_radius_m is not None
+            else float(node.get_parameter("viewpoint_plan_radius_m").value)
+        )
+        count_default = (
+            node._viewpoint_plan_num_viewpoints
+            if node._viewpoint_plan_num_viewpoints is not None
+            else int(node.get_parameter("viewpoint_plan_num_viewpoints").value)
+        )
+        self.viewpoint_radius_var = tk.StringVar(value=f"{radius_default:g}")
+        self.viewpoint_count_var = tk.StringVar(value=str(count_default))
+        self.viewpoint_filter_ik_var = tk.BooleanVar(
+            value=bool(node.get_parameter("viewpoint_plan_filter_ik").value)
+        )
+        self.viewpoint_planner_status_var = tk.StringVar(value="planner: unknown")
+        self.viewpoint_summary_var = tk.StringVar(value="no plan yet")
+        self.viewpoint_file_var = tk.StringVar(value="no file loaded")
+        self.viewpoint_rows: list[dict] = []
+        self.viewpoint_tree: ttk.Treeview | None = None
+        self._viewpoint_execute_busy = False
+
+        self._build_viewpoint_service_section(tab)
+        self._build_viewpoint_plan_params_section(tab)
+        self._build_viewpoint_results_section(tab)
+
+    def _build_viewpoint_service_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Viewpoint Planner Service")
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in range(3):
+            frame.columnconfigure(column, weight=1)
+        ttk.Button(
+            frame,
+            text="Start Planner",
+            command=lambda: self.node.start_managed_process("viewpoint_planner"),
+            style="Service.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Button(
+            frame,
+            text="Stop Planner",
+            command=lambda: self.node.stop_managed_process("viewpoint_planner"),
+        ).grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        ttk.Label(
+            frame, textvariable=self.viewpoint_planner_status_var, width=46
+        ).grid(row=0, column=2, sticky="w", padx=5, pady=5)
+
+    def _build_viewpoint_plan_params_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Plan Parameters")
+        frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for column in range(4):
+            frame.columnconfigure(column, weight=1)
+        for column, axis in enumerate(("x", "y", "z")):
+            ttk.Label(frame, text=f"{axis.upper()} m (base_link)").grid(
+                row=0, column=column, sticky="w", padx=5, pady=(4, 0)
+            )
+            ttk.Entry(frame, textvariable=self.viewpoint_xyz_vars[axis], width=10).grid(
+                row=1, column=column, sticky="ew", padx=5, pady=(0, 4)
+            )
+        ttk.Label(frame, text="Radius (m)").grid(
+            row=0, column=3, sticky="w", padx=5, pady=(4, 0)
+        )
+        ttk.Entry(frame, textvariable=self.viewpoint_radius_var, width=10).grid(
+            row=1, column=3, sticky="ew", padx=5, pady=(0, 4)
+        )
+        ttk.Label(frame, text="Count").grid(
+            row=2, column=0, sticky="w", padx=5, pady=4
+        )
+        ttk.Entry(frame, textvariable=self.viewpoint_count_var, width=10).grid(
+            row=2, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Checkbutton(
+            frame, text="Filter IK", variable=self.viewpoint_filter_ik_var
+        ).grid(row=2, column=2, sticky="w", padx=5, pady=4)
+        ttk.Label(frame, text="strategy: fibonacci_sphere").grid(
+            row=2, column=3, sticky="w", padx=5, pady=4
+        )
+        ttk.Button(
+            frame,
+            text="Plan",
+            command=self._plan_viewpoint_from_tab,
+            style="Primary.TButton",
+        ).grid(row=3, column=0, columnspan=4, sticky="ew", padx=5, pady=(4, 4))
+        ttk.Label(frame, textvariable=self.viewpoint_summary_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 4)
+        )
+
+    def _plan_viewpoint_from_tab(self) -> None:
+        try:
+            values = tuple(
+                float(self.viewpoint_xyz_vars[axis].get()) for axis in ("x", "y", "z")
+            )
+            radius_m = float(self.viewpoint_radius_var.get())
+            num_viewpoints = int(self.viewpoint_count_var.get())
+        except ValueError:
+            messagebox.showwarning(
+                "Viewpoint Plan", "X / Y / Z / Radius / Count must be numbers"
+            )
+            return
+        if radius_m <= 0.0:
+            messagebox.showwarning("Viewpoint Plan", "Radius must be > 0")
+            return
+        if num_viewpoints < 1 or num_viewpoints > MAX_VIEWPOINT_COUNT:
+            messagebox.showwarning(
+                "Viewpoint Plan",
+                f"Count must be an integer in [1, {MAX_VIEWPOINT_COUNT}]",
+            )
+            return
+        node = self.node
+        # 与 Home 弹窗共用会话缓存，下次打开任一处均可预填本次输入
+        node._viewpoint_plan_target_xyz = values
+        node._viewpoint_plan_radius_m = radius_m
+        node._viewpoint_plan_num_viewpoints = num_viewpoints
+        self.viewpoint_summary_var.set(
+            f"planning target=({values[0]:.3f}, {values[1]:.3f}, {values[2]:.3f}) "
+            f"radius={radius_m:g} count={num_viewpoints} ..."
+        )
+        node.call_viewpoint_plan(
+            values,
+            radius_m=radius_m,
+            num_viewpoints=num_viewpoints,
+            filter_ik=bool(self.viewpoint_filter_ik_var.get()),
+            on_success=lambda path: self.root.after(
+                0, lambda: self._load_viewpoint_result(path)
+            ),
+        )
+
+    def _load_viewpoint_result(self, path) -> None:
+        """Load a viewpoint plan result JSON into the list (UI thread)."""
+        if path is None:
+            self.viewpoint_summary_var.set(
+                "plan ok but result file write failed (see node log)"
+            )
+            return
+        self.viewpoint_file_var.set(f"file: {path}")
+        try:
+            data = _parse_viewpoint_plan_file(path)
+        except (OSError, ValueError, KeyError) as error:
+            self.viewpoint_summary_var.set(f"load failed: {error}")
+            return
+        self._render_viewpoint_rows(data)
+        reachable = sum(1 for row in self.viewpoint_rows if row["ik_reachable"])
+        self.viewpoint_summary_var.set(
+            f"{len(self.viewpoint_rows)} viewpoints, {reachable} ik-reachable | {path}"
+        )
+
+    def _build_viewpoint_results_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Planned Viewpoints (JSON)")
+        frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 0))
+        toolbar.columnconfigure(2, weight=1)
+        ttk.Button(
+            toolbar, text="Load JSON...", command=self._load_viewpoint_file_dialog
+        ).grid(row=0, column=0, padx=(0, 5), pady=4)
+        self.viewpoint_execute_button = ttk.Button(
+            toolbar,
+            text="Execute",
+            command=self._execute_viewpoint_selected,
+            style="Service.TButton",
+        )
+        self.viewpoint_execute_button.grid(row=0, column=1, padx=(0, 5), pady=4)
+        ttk.Label(toolbar, textvariable=self.viewpoint_file_var).grid(
+            row=0, column=2, sticky="w", padx=5, pady=4
+        )
+
+        columns = ("index", "reach", "camera", "tool0", "joints")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+        for key, text, width, anchor in (
+            ("index", "#", 5, "center"),
+            ("reach", "reach", 8, "center"),
+            ("camera", "camera_xyz", 24, "center"),
+            ("tool0", "tool0_xyz", 24, "center"),
+            ("joints", "joints (deg)", 32, "center"),
+        ):
+            tree.heading(key, text=text)
+            tree.column(key, width=width, anchor=anchor, stretch=False)
+        tree.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        scroll = ttk.Scrollbar(frame, command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns", pady=5)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.tag_configure("unreachable", foreground="#888888")
+        tree.bind("<Double-1>", lambda _event: self._execute_viewpoint_selected())
+        self.viewpoint_tree = tree
+
+    def _load_viewpoint_file_dialog(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load Viewpoint Plan JSON",
+            initialdir=str(self.node.runtime_log_dir),
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        self._load_viewpoint_result(path)
+
+    def _render_viewpoint_rows(self, data: dict) -> None:
+        tree = self.viewpoint_tree
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        self.viewpoint_rows = data.get("viewpoints", [])
+        for index, row in enumerate(self.viewpoint_rows):
+            camera = row["camera_xyz_base"]
+            tool0 = row["tool0_xyz_base"]
+            joints = row["ik_joints_deg"]
+            values = (
+                str(index),
+                "yes" if row["ik_reachable"] else "no",
+                f"({camera[0]:.2f}, {camera[1]:.2f}, {camera[2]:.2f})",
+                f"({tool0[0]:.2f}, {tool0[1]:.2f}, {tool0[2]:.2f})",
+                " ".join(f"{value:.1f}" for value in joints),
+            )
+            tags = () if row["ik_reachable"] else ("unreachable",)
+            tree.insert("", tk.END, iid=str(index), values=values, tags=tags)
+
+    def _set_viewpoint_execute_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        try:
+            if self.viewpoint_execute_button is not None:
+                self.viewpoint_execute_button.configure(state=state)
+            if self.viewpoint_tree is not None:
+                # ttk.Treeview 不支持 configure(state=...)，必须用 ttk 的 state() 方法
+                if enabled:
+                    self.viewpoint_tree.state(["!disabled"])
+                else:
+                    self.viewpoint_tree.state(["disabled"])
+        except Exception as error:  # noqa: BLE001 - UI 状态设置失败不阻断运动
+            self.node._status(f"viewpoint execute ui state failed: {error}", warn=True)
+
+    def _execute_viewpoint_selected(self) -> None:
+        """Execute the selected viewpoint row: confirm, then move the arm."""
+        tree = self.viewpoint_tree
+        if tree is None:
+            return
+        if self._viewpoint_execute_busy:
+            self.node._status("viewpoint execute: busy", warn=True)
+            return
+        selection = tree.selection()
+        if not selection:
+            self.node._status("viewpoint execute: select a row first", warn=True)
+            return
+        index = int(selection[0])
+        if index < 0 or index >= len(self.viewpoint_rows):
+            return
+        row = self.viewpoint_rows[index]
+        if not row["ik_reachable"]:
+            self.node._status(
+                f"viewpoint #{index} is not ik-reachable; execution refused", warn=True
+            )
+            return
+        tool0 = row["tool0_xyz_base"]
+        joints = row["ik_joints_deg"]
+        if not messagebox.askyesno(
+            "Viewpoint Execute",
+            f"Move arm to viewpoint #{index}?\n\n"
+            f"tool0 = ({tool0[0]:.3f}, {tool0[1]:.3f}, {tool0[2]:.3f}) m\n"
+            f"joints(deg) = {', '.join(f'{value:.1f}' for value in joints)}",
+        ):
+            return
+        self._viewpoint_execute_busy = True
+        self.node._write_event(
+            "viewpoint_execute",
+            f"viewpoint execute requested: #{index}",
+            viewpoint_index=index,
+            tool0_xyz=[float(value) for value in tool0],
+            ik_joints_deg=[float(value) for value in joints],
+            file=str(self.viewpoint_file_var.get()),
+        )
+        self.node._status(f"viewpoint execute: #{index} joints={', '.join(f'{value:.1f}' for value in joints)} deg")
+
+        def done() -> None:
+            self.root.after(0, self._viewpoint_execute_done)
+
+        # 先启动运动再禁用 UI：busy 标志本身防重入，UI 状态设置失败不阻断运动
+        self.node.move_arm_to_joints_degrees(joints, on_done=done)
+        self._set_viewpoint_execute_enabled(False)
+
+    def _viewpoint_execute_done(self) -> None:
+        self._viewpoint_execute_busy = False
+        self._set_viewpoint_execute_enabled(True)
+        self.node._status("viewpoint execute finished")
 
     def _build_program_tab(self) -> None:
         tab = self._add_scrollable_tab("Program")
@@ -5903,6 +6503,102 @@ class TeachPanelApp:
         button.bind("<Leave>", lambda _event: self._preset_hold_release())
         return button
 
+    def _prompt_viewpoint_plan(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Viewpoint Plan")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(1, weight=1)
+        node = self.node
+        latest = node.latest_detection_xyz
+        cached_xyz = node._viewpoint_plan_target_xyz
+        # 预填优先级：最新检测值 > 上次手动输入（会话缓存）> 默认值
+        if latest is not None:
+            defaults = latest
+            source = "latest taco_instances"
+        elif cached_xyz is not None:
+            defaults = cached_xyz
+            source = "last input"
+        else:
+            defaults = (0.3, 0.0, 0.2)
+            source = "default"
+        fields: list[tuple[str, tk.StringVar]] = []
+        for index, (label, default) in enumerate(zip(("X", "Y", "Z"), defaults)):
+            ttk.Label(dialog, text=label).grid(
+                row=index, column=0, padx=6, pady=4, sticky="w"
+            )
+            var = tk.StringVar(value=f"{float(default):.3f}")
+            ttk.Entry(dialog, textvariable=var, width=12).grid(
+                row=index, column=1, padx=6, pady=4, sticky="ew"
+            )
+            fields.append((label, var))
+
+        # 球面采样参数：会话缓存（上次输入）优先，未设置时回落节点参数默认值
+        radius_default = (
+            node._viewpoint_plan_radius_m
+            if node._viewpoint_plan_radius_m is not None
+            else float(node.get_parameter("viewpoint_plan_radius_m").value)
+        )
+        count_default = (
+            node._viewpoint_plan_num_viewpoints
+            if node._viewpoint_plan_num_viewpoints is not None
+            else int(node.get_parameter("viewpoint_plan_num_viewpoints").value)
+        )
+        radius_var = tk.StringVar(value=f"{radius_default:g}")
+        count_var = tk.StringVar(value=str(count_default))
+        row = len(fields)  # X/Y/Z 之后
+        ttk.Label(dialog, text="Radius (m)").grid(
+            row=row, column=0, padx=6, pady=4, sticky="w"
+        )
+        ttk.Entry(dialog, textvariable=radius_var, width=12).grid(
+            row=row, column=1, padx=6, pady=4, sticky="ew"
+        )
+        row += 1
+        ttk.Label(dialog, text="Count").grid(
+            row=row, column=0, padx=6, pady=4, sticky="w"
+        )
+        ttk.Entry(dialog, textvariable=count_var, width=12).grid(
+            row=row, column=1, padx=6, pady=4, sticky="ew"
+        )
+        ttk.Label(
+            dialog, text=f"target xyz in base_link (prefilled: {source})"
+        ).grid(row=row + 1, column=0, columnspan=2, padx=6, pady=2, sticky="w")
+
+        def confirm() -> None:
+            try:
+                values = tuple(float(var.get()) for _, var in fields)
+                radius_m = float(radius_var.get())
+                num_viewpoints = int(count_var.get())
+            except ValueError:
+                messagebox.showwarning(
+                    "Viewpoint Plan",
+                    "X / Y / Z / Radius / Count must be numbers",
+                    parent=dialog,
+                )
+                return
+            if radius_m <= 0.0:
+                messagebox.showwarning(
+                    "Viewpoint Plan", "Radius must be > 0", parent=dialog
+                )
+                return
+            if num_viewpoints < 1 or num_viewpoints > MAX_VIEWPOINT_COUNT:
+                messagebox.showwarning(
+                    "Viewpoint Plan",
+                    f"Count must be an integer in [1, {MAX_VIEWPOINT_COUNT}]",
+                    parent=dialog,
+                )
+                return
+            # 仅本次调用生效：缓存供下次打开弹窗预填，但不写回节点参数
+            node._viewpoint_plan_target_xyz = values
+            node._viewpoint_plan_radius_m = radius_m
+            node._viewpoint_plan_num_viewpoints = num_viewpoints
+            dialog.destroy()
+            node.call_viewpoint_plan(values, radius_m=radius_m, num_viewpoints=num_viewpoints)
+
+        ttk.Button(dialog, text="Plan", command=confirm).grid(
+            row=row + 2, column=0, columnspan=2, sticky="ew", padx=6, pady=6
+        )
+
     def _publish_custom_gripper(self) -> None:
         text = self.gripper_custom_var.get().strip()
         command = _normalize_gripper_command(text)
@@ -5954,6 +6650,7 @@ class TeachPanelApp:
         self._refresh_joint_tree()
         self._refresh_logs()
         self._refresh_hand_eye(snapshot)
+        self._refresh_viewpoint(snapshot)
         self.root.after(100, self._refresh)
 
     def _refresh_hand_eye(self, snapshot: dict[str, str]) -> None:
@@ -5971,6 +6668,16 @@ class TeachPanelApp:
                 text.delete("1.0", tk.END)
                 text.insert(tk.END, result)
                 text.configure(state="disabled")
+
+    def _refresh_viewpoint(self, snapshot: dict[str, str]) -> None:
+        process_text = snapshot.get("viewpoint_planner", "stopped")
+        client = getattr(self.node, "viewpoint_plan_client", None)
+        try:
+            ready = bool(client.wait_for_service(timeout_sec=0.0)) if client is not None else False
+        except Exception:  # noqa: BLE001 - 状态显示兜底
+            ready = False
+        service_text = "service ready" if ready else "service not ready"
+        self.viewpoint_planner_status_var.set(f"planner: {process_text} | {service_text}")
 
     def _refresh_move_joint_values(self) -> None:
         joints = self.node.joint_snapshot()

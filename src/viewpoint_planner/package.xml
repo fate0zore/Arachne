@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>viewpoint_planner</name>
+  <version>0.1.0</version>
+  <description>Viewpoint planning around a target (fibonacci sphere sampling + IK reachability filter).</description>
+  <maintainer email="maintainer@example.com">Arachne Maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>arachne_operator</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>viewpoint_planner_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
