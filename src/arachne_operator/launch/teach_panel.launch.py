@@ -334,6 +334,12 @@ def generate_launch_description():
                 "rear_rack_keepout_max_xyz": LaunchConfiguration(
                     "rear_rack_keepout_max_xyz"
                 ),
+                "front_basket_keepout_min_xyz": LaunchConfiguration(
+                    "front_basket_keepout_min_xyz"
+                ),
+                "front_basket_keepout_max_xyz": LaunchConfiguration(
+                    "front_basket_keepout_max_xyz"
+                ),
                 "arm_keepout_sample_step_m": ParameterValue(
                     LaunchConfiguration("arm_keepout_sample_step_m"), value_type=float
                 ),
@@ -558,6 +564,12 @@ def generate_launch_description():
             DeclareLaunchArgument("arm_base_rpy", default_value="0.0,0.0,1.57079632679"),
             DeclareLaunchArgument("rear_rack_keepout_min_xyz", default_value="-0.41,-0.22,0.04"),
             DeclareLaunchArgument("rear_rack_keepout_max_xyz", default_value="0.09,0.22,0.82"),
+            DeclareLaunchArgument(
+                "front_basket_keepout_min_xyz", default_value="0.4215,-0.11,-0.1235"
+            ),
+            DeclareLaunchArgument(
+                "front_basket_keepout_max_xyz", default_value="0.6655,0.11,0.0635"
+            ),
             DeclareLaunchArgument("arm_keepout_sample_step_m", default_value="0.035"),
             DeclareLaunchArgument("arm_keepout_joint_step_rad", default_value="0.06"),
             DeclareLaunchArgument(

@@ -46,6 +46,11 @@ from arachne_operator.control_owner import (
 from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
 from arachne_operator.hand_eye_calibration_check import check_calibration, check_pose
 from arachne_operator.repo_paths import root_dir
+from arachne_operator.ee_collision import (
+    DEFAULT_EE_CAMERA_MARGIN_M,
+    ee_camera_boxes_tool0,
+    ee_envelope_points_tool0,
+)
 
 
 DEFAULT_REAL_ARM_JOINTS = (
@@ -67,6 +72,9 @@ DEFAULT_ARM_BASE_XYZ = "0.22,0.0,0.105"
 DEFAULT_ARM_BASE_RPY = "0.0,0.0,1.57079632679"
 DEFAULT_REAR_RACK_KEEPOUT_MIN_XYZ = "-0.41,-0.22,0.04"
 DEFAULT_REAR_RACK_KEEPOUT_MAX_XYZ = "0.09,0.22,0.82"
+# 前篮筐 keepout（base_link 系），与 grasp_preview_pipeline --basket-keepout-*-base 默认值一致
+DEFAULT_FRONT_BASKET_KEEPOUT_MIN_XYZ = "0.4215,-0.11,-0.1235"
+DEFAULT_FRONT_BASKET_KEEPOUT_MAX_XYZ = "0.6655,0.11,0.0635"
 DEFAULT_TEACH_CONFIG_PATH = "recordings/teach/teach_panel_config.json"
 DEFAULT_DEMO_RECORDING_PATH = "recordings/teach/arachne_teach_20260629_213710.json"
 DEFAULT_HAND_EYE_EXTRINSICS_DIR = "config/hand_eye_camera_extrinsics"
@@ -626,6 +634,14 @@ class TeachPanelNode(Node):
         self.declare_parameter("arm_base_rpy", DEFAULT_ARM_BASE_RPY)
         self.declare_parameter("rear_rack_keepout_min_xyz", DEFAULT_REAR_RACK_KEEPOUT_MIN_XYZ)
         self.declare_parameter("rear_rack_keepout_max_xyz", DEFAULT_REAR_RACK_KEEPOUT_MAX_XYZ)
+        self.declare_parameter(
+            "front_basket_keepout_min_xyz", DEFAULT_FRONT_BASKET_KEEPOUT_MIN_XYZ
+        )
+        self.declare_parameter(
+            "front_basket_keepout_max_xyz", DEFAULT_FRONT_BASKET_KEEPOUT_MAX_XYZ
+        )
+        # 末端相机/支撑板偏心包络在 URDF 几何外的额外 margin（m）
+        self.declare_parameter("arm_keepout_ee_margin_m", DEFAULT_EE_CAMERA_MARGIN_M)
         self.declare_parameter("arm_keepout_sample_step_m", 0.035)
         self.declare_parameter("arm_keepout_joint_step_rad", 0.06)
         self.declare_parameter("aubo_teach_command_topic", "/arachne/aubo/teach_command")
@@ -1621,6 +1637,15 @@ class TeachPanelNode(Node):
                 "rear_rack_keepout_max_xyz": str(
                     self.get_parameter("rear_rack_keepout_max_xyz").value
                 ),
+                "front_basket_keepout_min_xyz": str(
+                    self.get_parameter("front_basket_keepout_min_xyz").value
+                ),
+                "front_basket_keepout_max_xyz": str(
+                    self.get_parameter("front_basket_keepout_max_xyz").value
+                ),
+                "arm_keepout_ee_margin_m": float(
+                    self.get_parameter("arm_keepout_ee_margin_m").value
+                ),
                 "arm_keepout_sample_step_m": float(
                     self.get_parameter("arm_keepout_sample_step_m").value
                 ),
@@ -1655,6 +1680,20 @@ class TeachPanelNode(Node):
             "rear_rack_keepout_max_xyz",
             self.get_parameter("rear_rack_keepout_max_xyz").value,
         )
+        basket_keepout_min = safety.get(
+            "front_basket_keepout_min_xyz",
+            self.get_parameter("front_basket_keepout_min_xyz").value,
+        )
+        basket_keepout_max = safety.get(
+            "front_basket_keepout_max_xyz",
+            self.get_parameter("front_basket_keepout_max_xyz").value,
+        )
+        ee_margin = float(
+            safety.get(
+                "arm_keepout_ee_margin_m",
+                self.get_parameter("arm_keepout_ee_margin_m").value,
+            )
+        )
         payload_mass = float(
             payload_defaults.get(
                 "mass_kg",
@@ -1681,6 +1720,10 @@ class TeachPanelNode(Node):
         )
         _parse_vector3(str(keepout_min))
         _parse_vector3(str(keepout_max))
+        _parse_vector3(str(basket_keepout_min))
+        _parse_vector3(str(basket_keepout_max))
+        if ee_margin < 0.0:
+            raise ValueError("arm_keepout_ee_margin_m must be non-negative")
         _parse_vector(payload_cog, expected=3, label="payload cog")
         _parse_vector(payload_aom, expected=3, label="payload aom")
         _parse_vector(payload_inertia, expected=6, label="payload inertia")
@@ -1839,6 +1882,21 @@ class TeachPanelNode(Node):
                     "rear_rack_keepout_max_xyz",
                     Parameter.Type.STRING,
                     str(keepout_max),
+                ),
+                Parameter(
+                    "front_basket_keepout_min_xyz",
+                    Parameter.Type.STRING,
+                    str(basket_keepout_min),
+                ),
+                Parameter(
+                    "front_basket_keepout_max_xyz",
+                    Parameter.Type.STRING,
+                    str(basket_keepout_max),
+                ),
+                Parameter(
+                    "arm_keepout_ee_margin_m",
+                    Parameter.Type.DOUBLE,
+                    ee_margin,
                 ),
                 Parameter(
                     "arm_keepout_sample_step_m",
@@ -4754,6 +4812,14 @@ class TeachPanelNode(Node):
             boxes = self._arm_keepout_boxes()
             path = self._arm_keepout_path(np.array(positions, dtype=float))
             for path_index, q in enumerate(path, start=1):
+                # 末端相机/支撑板偏心包络用盒-盒相交判定（点采样对斜向穿透漏检，
+                # 2026-08-13 事故即 support 板斜插篮筐沿、14 个采样点无一落入 keepout）
+                box_violation = self._arm_keepout_ee_box_violation(q, boxes)
+                if box_violation is not None:
+                    return (
+                        f"{label} enters {box_violation} "
+                        f"at path sample {path_index}/{len(path)}"
+                    )
                 for sample_name, point in self._arm_keepout_samples(q):
                     for box in boxes:
                         if bool(np.all(point >= box.minimum) and np.all(point <= box.maximum)):
@@ -4766,12 +4832,65 @@ class TeachPanelNode(Node):
             return f"keepout config invalid: {exc}"
         return None
 
+    def _arm_keepout_ee_box_violation(
+        self, q: np.ndarray, boxes: list[KeepoutBox]
+    ) -> str | None:
+        """末端相机/支撑板包络（tool0 系 AABB）旋转到 base_link 后与 keepout box
+        做 AABB 相交判定；相交返回描述串，否则 None。"""
+        arm_base = _transform_from_xyz_rpy(
+            _parse_vector3(str(self.get_parameter("arm_base_xyz").value)),
+            _parse_vector3(str(self.get_parameter("arm_base_rpy").value)),
+        )
+        tool_transform = arm_base @ self.kinematics.fk(np.asarray(q, dtype=float))
+        rotation = tool_transform[:3, :3]
+        origin = tool_transform[:3, 3]
+        ee_margin = float(self.get_parameter("arm_keepout_ee_margin_m").value)
+        for ee_box in ee_camera_boxes_tool0(margin_m=ee_margin):
+            center = np.asarray(ee_box.center, dtype=np.float64)
+            half = np.asarray(ee_box.half, dtype=np.float64)
+            corners = np.array(
+                [
+                    [sx * half[0], sy * half[1], sz * half[2]]
+                    for sx in (-1.0, 1.0)
+                    for sy in (-1.0, 1.0)
+                    for sz in (-1.0, 1.0)
+                ],
+                dtype=np.float64,
+            )
+            points = corners @ rotation.T + origin
+            minimum = points.min(axis=0)
+            maximum = points.max(axis=0)
+            for keepout in boxes:
+                if bool(
+                    np.all(minimum <= keepout.maximum)
+                    and np.all(maximum >= keepout.minimum)
+                ):
+                    return (
+                        f"{keepout.name}: {ee_box.name} box "
+                        f"base_link x=[{minimum[0]:.3f},{maximum[0]:.3f}] "
+                        f"y=[{minimum[1]:.3f},{maximum[1]:.3f}] "
+                        f"z=[{minimum[2]:.3f},{maximum[2]:.3f}]"
+                    )
+        return None
+
     def _arm_keepout_boxes(self) -> list[KeepoutBox]:
-        minimum = _parse_vector3(str(self.get_parameter("rear_rack_keepout_min_xyz").value))
-        maximum = _parse_vector3(str(self.get_parameter("rear_rack_keepout_max_xyz").value))
-        if bool(np.any(maximum <= minimum)):
+        boxes: list[KeepoutBox] = []
+        rack_minimum = _parse_vector3(str(self.get_parameter("rear_rack_keepout_min_xyz").value))
+        rack_maximum = _parse_vector3(str(self.get_parameter("rear_rack_keepout_max_xyz").value))
+        if bool(np.any(rack_maximum <= rack_minimum)):
             raise ValueError("rear rack keepout max must be greater than min")
-        return [KeepoutBox("rear rack keepout", minimum, maximum)]
+        boxes.append(KeepoutBox("rear rack keepout", rack_minimum, rack_maximum))
+        # 前篮筐 keepout（事故场景：下降时相机挂到篮筐沿；旧版只有后货架 box，漏检）
+        basket_minimum = _parse_vector3(
+            str(self.get_parameter("front_basket_keepout_min_xyz").value)
+        )
+        basket_maximum = _parse_vector3(
+            str(self.get_parameter("front_basket_keepout_max_xyz").value)
+        )
+        if bool(np.any(basket_maximum <= basket_minimum)):
+            raise ValueError("front basket keepout max must be greater than min")
+        boxes.append(KeepoutBox("front basket keepout", basket_minimum, basket_maximum))
+        return boxes
 
     def _arm_keepout_path(self, target: np.ndarray) -> list[np.ndarray]:
         current = self._current_arm_vector()
@@ -4813,11 +4932,17 @@ class TeachPanelNode(Node):
             "tool_envelope_x-": (-0.070, 0.0, 0.090),
             "tool_envelope_y+": (0.0, 0.070, 0.090),
             "tool_envelope_y-": (0.0, -0.070, 0.090),
-            "camera_envelope": (0.025, -0.090, 0.050),
         }
         tool_origin = tool_transform[:3, 3]
         for name, local in tool_points.items():
             point = tool_transform[:3, :3] @ np.array(local, dtype=float) + tool_origin
+            samples.append((name, point))
+        # 末端相机/支撑板偏心包络（tool0 系，URDF 推导，含 margin）：旧版单点
+        # "camera_envelope" (0.025,-0.090,0.050) 与真实相机位置
+        # (≈0.049,0.056,0.018，支持板 135° 安装后侧向悬出) 不符，事故即因此漏检。
+        ee_margin = float(self.get_parameter("arm_keepout_ee_margin_m").value)
+        for name, local in ee_envelope_points_tool0(margin_m=ee_margin):
+            point = tool_transform[:3, :3] @ local + tool_origin
             samples.append((name, point))
         return samples
 

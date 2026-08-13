@@ -41,10 +41,12 @@ from visualization_msgs.msg import Marker, MarkerArray
 try:
     from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
     from arachne_operator.aubo_move_joint_client import AuboMoveJointClient
+    from arachne_operator.ee_collision import ee_camera_boxes_tool0
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src" / "arachne_operator"))
     from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
     from arachne_operator.aubo_move_joint_client import AuboMoveJointClient
+    from arachne_operator.ee_collision import ee_camera_boxes_tool0
 
 try:
     from arachne_hardware.aubo_tcp_driver import AuboDirectJsonRpc
@@ -454,6 +456,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-radius", type=float, default=0.055, help=hidden)
     parser.add_argument("--arm-collision-radius", type=float, default=0.035, help=hidden)
     parser.add_argument("--arm-collision-samples-per-link", type=int, default=6, help=hidden)
+    parser.add_argument(
+        "--ee-camera-collision-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=hidden,
+    )
+    parser.add_argument("--ee-camera-collision-margin", type=float, default=0.010, help=hidden)
     parser.add_argument("--collision-margin", type=float, default=0.015, help=hidden)
     parser.add_argument("--rear-rack-collision-margin", type=float, default=0.005, help=hidden)
     parser.add_argument("--ground-min-z-base", type=float, default=-0.22, help=hidden)
@@ -5679,9 +5688,9 @@ class GraspPreviewNode(Node):
             self._transform_matrix_point(base_from_aubo, transform[:3, 3])
             for _name, transform in self.kinematics.link_transforms(np.asarray(q, dtype=float))
         ]
+        tool_in_aubo = self.kinematics.fk(np.asarray(q, dtype=float))
         tool_to_grasp, _message = self._tool_to_grasp_matrix()
         if tool_to_grasp is not None:
-            tool_in_aubo = self.kinematics.fk(np.asarray(q, dtype=float))
             grasp_in_base = np.asarray(base_from_aubo, dtype=float) @ tool_in_aubo @ tool_to_grasp
             link_points.append(tuple(float(value) for value in grasp_in_base[:3, 3]))
         samples_per_link = max(int(self.args.arm_collision_samples_per_link), 2)
@@ -5693,25 +5702,94 @@ class GraspPreviewNode(Node):
         )
         min_clearance = float("inf")
         hit_name: str | None = None
+
+        def check_point(point: np.ndarray) -> bool:
+            """单点碰撞/接地检查；更新 min_clearance/hit_name，命中则返回 False。"""
+            nonlocal min_clearance, hit_name
+            ground_clearance = float(point[2] - ground_threshold)
+            if ground_clearance < min_clearance:
+                min_clearance = ground_clearance
+                hit_name = "ground/arm"
+            if ground_clearance < 0.0:
+                return False
+            for box in self.collision_boxes:
+                clearance = self._point_box_clearance(point, box) - radius
+                if clearance < min_clearance:
+                    min_clearance = float(clearance)
+                    hit_name = box.name
+                if clearance < 0.0:
+                    return False
+            return True
+
         for start, end in zip(link_points[1:], link_points[2:]):
             a = np.asarray(start, dtype=float)
             b = np.asarray(end, dtype=float)
             for t in np.linspace(0.0, 1.0, samples_per_link):
                 point = a * (1.0 - t) + b * t
-                ground_clearance = float(point[2] - ground_threshold)
+                if not check_point(point):
+                    return False, float(min_clearance), hit_name
+        # 末端相机/支撑板偏心包络（tool0 系，URDF 推导）：旋转到 base_link 后做
+        # 盒-盒（AABB）相交/距离判定。点采样对斜向穿透会漏检（2026-08-13 事故：
+        # support 板斜插篮筐沿，14 个采样点无一落入 keepout），故改用盒判定。
+        # 包络本身已含 margin + AABB 保守化，不再叠加 arm_collision_radius。
+        if bool(self.args.ee_camera_collision_enabled):
+            ee_margin = max(float(self.args.ee_camera_collision_margin), 0.0)
+            tool_in_base = np.asarray(base_from_aubo, dtype=float) @ tool_in_aubo
+            ee_rotation = tool_in_base[:3, :3]
+            ee_origin = tool_in_base[:3, 3]
+            for ee_box in ee_camera_boxes_tool0(margin_m=ee_margin):
+                center = np.asarray(ee_box.center, dtype=np.float64)
+                half = np.asarray(ee_box.half, dtype=np.float64)
+                corners = np.array(
+                    [
+                        [sx * half[0], sy * half[1], sz * half[2]]
+                        for sx in (-1.0, 1.0)
+                        for sy in (-1.0, 1.0)
+                        for sz in (-1.0, 1.0)
+                    ],
+                    dtype=np.float64,
+                )
+                points = corners @ ee_rotation.T + ee_origin
+                box_minimum = points.min(axis=0)
+                box_maximum = points.max(axis=0)
+                ground_clearance = float(box_minimum[2] - ground_threshold)
                 if ground_clearance < min_clearance:
                     min_clearance = ground_clearance
                     hit_name = "ground/arm"
                 if ground_clearance < 0.0:
-                    return False, ground_clearance, "ground/arm"
+                    return False, float(min_clearance), hit_name
                 for box in self.collision_boxes:
-                    clearance = self._point_box_clearance(point, box) - radius
+                    box_center = np.asarray(box.center, dtype=np.float64)
+                    box_half = 0.5 * np.asarray(box.size, dtype=np.float64)
+                    clearance = self._box_box_clearance(
+                        box_minimum,
+                        box_maximum,
+                        box_center - box_half,
+                        box_center + box_half,
+                    )
                     if clearance < min_clearance:
                         min_clearance = float(clearance)
                         hit_name = box.name
                     if clearance < 0.0:
-                        return False, float(clearance), box.name
+                        return False, float(min_clearance), hit_name
         return True, float(min_clearance if np.isfinite(min_clearance) else 0.0), hit_name
+
+    def _box_box_clearance(
+        self,
+        minimum_a: np.ndarray,
+        maximum_a: np.ndarray,
+        minimum_b: np.ndarray,
+        maximum_b: np.ndarray,
+    ) -> float:
+        """两个轴对齐盒（AABB）的距离：分离时为正距离，相交时为负渗透深度。"""
+        overlap_min = np.maximum(minimum_a, minimum_b)
+        overlap_max = np.minimum(maximum_a, maximum_b)
+        if bool(np.all(overlap_min <= overlap_max)):
+            return float(-np.min(overlap_max - overlap_min))
+        separation = np.maximum(
+            np.maximum(minimum_b - maximum_a, minimum_a - maximum_b), 0.0
+        )
+        return float(np.linalg.norm(separation))
 
     def _point_box_clearance(self, point: np.ndarray, box: CollisionBox) -> float:
         center = np.asarray(box.center, dtype=float)
