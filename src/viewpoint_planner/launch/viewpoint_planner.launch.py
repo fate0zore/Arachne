@@ -4,10 +4,11 @@ Parameters (all optional, overriding the node defaults):
   radius_m, num_viewpoints, strategy, filter_ik_reachable, joint_states_topic
 """
 
-from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+from launch import LaunchDescription
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -49,6 +50,26 @@ def generate_launch_description() -> LaunchDescription:
         default_value="base_link",
         description="frame_id used for the viewpoint markers",
     )
+    declare_label_enabled = DeclareLaunchArgument(
+        "marker_label_enabled",
+        default_value="true",
+        description="show per-viewpoint index labels in RViz",
+    )
+    declare_label_offset = DeclareLaunchArgument(
+        "marker_label_offset_z",
+        default_value="0.08",
+        description="index label height above the camera origin (m)",
+    )
+    declare_label_size = DeclareLaunchArgument(
+        "marker_label_size",
+        default_value="0.06",
+        description="index label font height (m)",
+    )
+    declare_republish_period = DeclareLaunchArgument(
+        "markers_republish_period_sec",
+        default_value="1.0",
+        description="periodic republish of the last marker array (0 = off)",
+    )
     declare_ik_budget = DeclareLaunchArgument(
         "ik_time_budget_sec",
         default_value="12.0",
@@ -70,6 +91,12 @@ def generate_launch_description() -> LaunchDescription:
                 "publish_markers": LaunchConfiguration("publish_markers"),
                 "markers_topic": LaunchConfiguration("markers_topic"),
                 "markers_frame": LaunchConfiguration("markers_frame"),
+                "marker_label_enabled": LaunchConfiguration("marker_label_enabled"),
+                "marker_label_offset_z": LaunchConfiguration("marker_label_offset_z"),
+                "marker_label_size": LaunchConfiguration("marker_label_size"),
+                "markers_republish_period_sec": LaunchConfiguration(
+                    "markers_republish_period_sec"
+                ),
                 "ik_time_budget_sec": LaunchConfiguration("ik_time_budget_sec"),
             }
         ],
@@ -85,6 +112,10 @@ def generate_launch_description() -> LaunchDescription:
             declare_publish_markers,
             declare_markers_topic,
             declare_markers_frame,
+            declare_label_enabled,
+            declare_label_offset,
+            declare_label_size,
+            declare_republish_period,
             declare_ik_budget,
             node,
         ]

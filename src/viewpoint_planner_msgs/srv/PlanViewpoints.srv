@@ -4,6 +4,7 @@ string strategy                # strategy name, default "fibonacci_sphere"
 float64 radius_m               # sampling radius (sphere centered on target), default 0.5
 uint32 num_viewpoints          # number of viewpoints to sample, default 32
 bool filter_ik_reachable       # filter to IK-reachable viewpoints, default true
+bool filter_collision_free     # filter to collision-free viewpoints, default true
 float64[3] up_vector_base      # sphere reference axis in base_link frame, default [0, 0, 1]
 ---
 bool success

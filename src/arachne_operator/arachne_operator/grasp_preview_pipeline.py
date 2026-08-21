@@ -20,7 +20,7 @@ import numpy as np
 import rclpy
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
-from moveit_msgs.msg import Constraints, JointConstraint, OrientationConstraint, PositionConstraint
+from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint
 from moveit_msgs.srv import GetMotionPlan
 from nav_msgs.msg import Path as PathMsg
 from rclpy.action import ActionClient
@@ -42,11 +42,19 @@ try:
     from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
     from arachne_operator.aubo_move_joint_client import AuboMoveJointClient
     from arachne_operator.ee_collision import ee_camera_boxes_tool0
+    from arachne_operator.moveit_plan import (
+        build_joint_goal_motion_request,
+        call_moveit_joint_plan,
+    )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src" / "arachne_operator"))
     from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
     from arachne_operator.aubo_move_joint_client import AuboMoveJointClient
     from arachne_operator.ee_collision import ee_camera_boxes_tool0
+    from arachne_operator.moveit_plan import (
+        build_joint_goal_motion_request,
+        call_moveit_joint_plan,
+    )
 
 try:
     from arachne_hardware.aubo_tcp_driver import AuboDirectJsonRpc
@@ -5016,20 +5024,6 @@ class GraspPreviewNode(Node):
             )
         return MoveItPlanAttempt(response, "pose goal success")
 
-    def _moveit_joint_goal_constraint(self, q_goal: np.ndarray) -> Constraints:
-        constraints = Constraints()
-        constraints.name = "grasp_preview_joint_goal"
-        tolerance = max(float(self.args.moveit_joint_goal_tolerance), 1e-4)
-        for name, position in zip(ARM_JOINT_NAMES, np.asarray(q_goal, dtype=float)):
-            joint = JointConstraint()
-            joint.joint_name = name
-            joint.position = float(position)
-            joint.tolerance_above = tolerance
-            joint.tolerance_below = tolerance
-            joint.weight = 1.0
-            constraints.joint_constraints.append(joint)
-        return constraints
-
     def _call_moveit_plan(
         self,
         q_start: np.ndarray,
@@ -5038,54 +5032,36 @@ class GraspPreviewNode(Node):
         planner_id: str,
     ) -> MoveItPlanAttempt:
         request = GetMotionPlan.Request()
-        motion_request = request.motion_plan_request
-        motion_request.group_name = "aubo_arm"
-        motion_request.pipeline_id = "ompl"
-        motion_request.planner_id = planner_id
-        motion_request.num_planning_attempts = max(int(self.args.moveit_planning_attempts), 1)
-        motion_request.allowed_planning_time = max(float(self.args.moveit_planning_time), 0.2)
-        motion_request.max_velocity_scaling_factor = min(
-            max(float(self.args.moveit_velocity_scale), 0.01), 1.0
-        )
-        motion_request.max_acceleration_scaling_factor = min(
-            max(float(self.args.moveit_accel_scale), 0.01), 1.0
-        )
         start_names, start_positions = self._moveit_start_state_joint_values(q_start)
-        motion_request.start_state.joint_state.name = start_names
-        motion_request.start_state.joint_state.position = start_positions
-        motion_request.start_state.is_diff = False
-        motion_request.workspace_parameters.header.frame_id = self.base_frame
-        motion_request.workspace_parameters.min_corner.x = -1.0
-        motion_request.workspace_parameters.min_corner.y = -1.0
-        motion_request.workspace_parameters.min_corner.z = -0.3
-        motion_request.workspace_parameters.max_corner.x = 1.6
-        motion_request.workspace_parameters.max_corner.y = 1.0
-        motion_request.workspace_parameters.max_corner.z = 1.2
-        motion_request.goal_constraints = [self._moveit_joint_goal_constraint(q_goal)]
-        if bool(self.args.moveit_use_orientation_path_constraint):
-            motion_request.path_constraints = self._moveit_orientation_path_constraint(
-                reference_rotation_base
-            )
-
-        future = self.moveit_plan_client.call_async(request)
-        deadline = time.monotonic() + max(
-            float(self.args.moveit_planning_time)
-            + max(float(self.args.moveit_service_timeout_padding), 0.0),
-            0.3,
+        build_joint_goal_motion_request(
+            request,
+            start_names=start_names,
+            start_positions=start_positions,
+            goal_joint_names=[joint.name for joint in self.kinematics.JOINTS],
+            goal_positions=[float(value) for value in q_goal],
+            goal_tolerance=float(self.args.moveit_joint_goal_tolerance),
+            planner_id=planner_id,
+            group_name="aubo_arm",
+            pipeline_id="ompl",
+            planning_attempts=int(self.args.moveit_planning_attempts),
+            planning_time=float(self.args.moveit_planning_time),
+            velocity_scale=float(self.args.moveit_velocity_scale),
+            acceleration_scale=float(self.args.moveit_accel_scale),
+            frame_id=self.base_frame,
+            workspace_min=(-1.0, -1.0, -0.3),
+            workspace_max=(1.6, 1.0, 1.2),
+            path_constraints=(
+                self._moveit_orientation_path_constraint(reference_rotation_base)
+                if bool(self.args.moveit_use_orientation_path_constraint)
+                else None
+            ),
         )
-        while not future.done() and time.monotonic() < deadline and rclpy.ok():
-            time.sleep(0.02)
-        if not future.done():
-            return MoveItPlanAttempt(None, "service timeout")
-        result = future.result()
-        if result is None:
-            return MoveItPlanAttempt(None, "empty service result")
-        response = result.motion_plan_response
-        if int(response.error_code.val) != 1:
-            return MoveItPlanAttempt(
-                None,
-                self._moveit_error_message(int(response.error_code.val)),
-            )
+        timeout = float(self.args.moveit_planning_time) + max(
+            float(self.args.moveit_service_timeout_padding), 0.0
+        )
+        ok, response, message = call_moveit_joint_plan(self.moveit_plan_client, request, timeout)
+        if not ok:
+            return MoveItPlanAttempt(None, message)
         return MoveItPlanAttempt(response, "success")
 
     def _moveit_pose_goal_constraint(

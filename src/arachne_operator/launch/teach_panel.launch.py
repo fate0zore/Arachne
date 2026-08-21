@@ -96,6 +96,33 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("with_real_bringup")),
     )
 
+    # MoveIt(move_group) —— 视点/预设位等批量运动的自碰撞检查通道（2026-08-21 方案 A）。
+    # 复用 arachne_moveit_config moveit_planning.launch.py：只起 move_group、不起 rviz/
+    # robot_state_publisher（避免与本 launch 的 visualization RSP 重复），joint 状态
+    # 用 teach 链路同一 topic，保证 MoveIt 规划场景跟踪当前臂姿态。
+    moveit_planning = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution(
+                [
+                    FindPackageShare("arachne_moveit_config"),
+                    "launch",
+                    "moveit_planning.launch.py",
+                ]
+            )
+        ),
+        launch_arguments={
+            "gripper_type": LaunchConfiguration("visualization_gripper_type"),
+            "launch_rviz": "false",
+            "with_robot_state_publisher": "false",
+            "joint_states_topic": LaunchConfiguration("moveit_joint_states_topic"),
+            "ee_support_xyz": LaunchConfiguration("visualization_ee_support_xyz"),
+            "ee_support_rpy": LaunchConfiguration("visualization_ee_support_rpy"),
+            "tool_adapter_xyz": LaunchConfiguration("visualization_tool_adapter_xyz"),
+            "tool_adapter_rpy": LaunchConfiguration("visualization_tool_adapter_rpy"),
+        }.items(),
+        condition=IfCondition(LaunchConfiguration("with_moveit_planning")),
+    )
+
     demo_orchestrator = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
@@ -142,6 +169,7 @@ def generate_launch_description():
                 "arm_follow_joint_trajectory_action": LaunchConfiguration(
                     "arm_follow_joint_trajectory_action"
                 ),
+                "moveit_plan_service": LaunchConfiguration("moveit_plan_service"),
                 "arm_trajectory_topic": LaunchConfiguration("arm_trajectory_topic"),
                 "legacy_arm_trajectory_topic": LaunchConfiguration(
                     "legacy_arm_trajectory_topic"
@@ -442,6 +470,10 @@ def generate_launch_description():
                 "arm_follow_joint_trajectory_action",
                 default_value="/joint_trajectory_controller/follow_joint_trajectory",
             ),
+            DeclareLaunchArgument("moveit_plan_service", default_value="/plan_kinematic_path"),
+            DeclareLaunchArgument(
+                "moveit_joint_states_topic", default_value="/arachne/moveit/joint_states"
+            ),
             DeclareLaunchArgument(
                 "arm_trajectory_topic",
                 default_value="/joint_trajectory_controller/joint_trajectory",
@@ -533,6 +565,7 @@ def generate_launch_description():
             DeclareLaunchArgument("aubo_move_joint_action_timeout_sec", default_value="0.5"),
             DeclareLaunchArgument("aubo_move_joint_fallback_internal", default_value="false"),
             DeclareLaunchArgument("with_demo_orchestrator", default_value="true"),
+            DeclareLaunchArgument("with_moveit_planning", default_value="true"),
             DeclareLaunchArgument("demo_orchestrator_enabled", default_value="true"),
             DeclareLaunchArgument("demo_orchestrator_fallback_internal", default_value="true"),
             DeclareLaunchArgument(
@@ -739,6 +772,7 @@ def generate_launch_description():
             visualization,
             camera,
             real_bringup,
+            moveit_planning,
             demo_orchestrator,
             teach_panel_node,
             RegisterEventHandler(
