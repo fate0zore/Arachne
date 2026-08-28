@@ -6,11 +6,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_WITH_GAZEBO="${ARACHNE_BUILD_WITH_GAZEBO:-auto}"
 
 case "${BUILD_WITH_GAZEBO}" in
-  auto|true|false) ;;
-  *)
-    echo "ARACHNE_BUILD_WITH_GAZEBO must be auto, true, or false. Current value: ${BUILD_WITH_GAZEBO}" >&2
-    exit 1
-    ;;
+auto | true | false) ;;
+*)
+  echo "ARACHNE_BUILD_WITH_GAZEBO must be auto, true, or false. Current value: ${BUILD_WITH_GAZEBO}" >&2
+  exit 1
+  ;;
 esac
 
 set +u
@@ -37,18 +37,24 @@ elif [[ "$(uname -m)" == "aarch64" ]]; then
   COLCON_ARGS+=(--parallel-workers 2)
 fi
 
-if [[ -f build/aubo_description/cmake_install.cmake ]] \
-  && grep -q 'ament_cmake_symlink_install' build/aubo_description/cmake_install.cmake; then
+# colcon dumps the full environment into generated prefix files and build
+# logs (log/build, build/**/colcon_command_prefix_*.sh.env). Drop live
+# CLI/auth tokens first so they never land in generated artifacts
+# (gitleaks flags VSCODE_CLI_REQUIRE_TOKEN; MCP tokens are secrets by design).
+unset VSCODE_CLI_REQUIRE_TOKEN ARACHNE_MCP_PLANNER_TOKEN ARACHNE_MCP_EXECUTION_TOKEN 2>/dev/null || true
+
+if [[ -f build/aubo_description/cmake_install.cmake ]] &&
+  grep -q 'ament_cmake_symlink_install' build/aubo_description/cmake_install.cmake; then
   echo "Removing stale symlink-install cache for aubo_description."
   rm -rf build/aubo_description install/aubo_description
 fi
 
 PACKAGES=(
-  lslidar_msgs lslidar_driver \
-  aubo_description scout_description dh_ag95_description \
-  arachne_sim arachne_gripper arachne_hardware arachne_control arachne_moveit_config \
-  arachne_nav arachne_operator arachne_sensors arachne_agent_bridge arachne_description \
-  viewpoint_planner_msgs viewpoint_planner
+  lslidar_msgs lslidar_driver
+  aubo_description scout_description dh_ag95_description
+  arachne_sim arachne_gripper arachne_hardware arachne_control arachne_moveit_config
+  arachne_nav arachne_operator arachne_sensors arachne_agent_bridge arachne_description
+  viewpoint_planner_msgs viewpoint_planner arachne_mcp
 )
 
 has_cmake_package() {
@@ -77,7 +83,7 @@ if [[ "${BUILD_WITH_GAZEBO}" == "true" && "${GAZEBO_DEPS_AVAILABLE}" != "true" ]
   exit 1
 fi
 
-if [[ "${BUILD_WITH_GAZEBO}" == "true" || ( "${BUILD_WITH_GAZEBO}" == "auto" && "${GAZEBO_DEPS_AVAILABLE}" == "true" ) ]]; then
+if [[ "${BUILD_WITH_GAZEBO}" == "true" || ("${BUILD_WITH_GAZEBO}" == "auto" && "${GAZEBO_DEPS_AVAILABLE}" == "true") ]]; then
   PACKAGES+=(arachne_gazebo arachne_demo)
 else
   echo "Skipping Gazebo demo packages. Set ARACHNE_BUILD_WITH_GAZEBO=true after installing Gazebo deps."

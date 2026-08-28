@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "arachne-viewpoint-planner": {
+      "type": "http",
+      "url": "http://192.168.1.132:8123/arachne/viewpoint/plan",
+      "authorization": {
+        "type": "bearer",
+        "scheme": "bearer",
+        "credentials": "REPLACE_WITH_ARACHNE_MCP_PLANNER_TOKEN"
+      }
+    },
+    "arachne-viewpoint-acquire": {
+      "type": "http",
+      "url": "http://192.168.1.132:8123/arachne/viewpoint/acquire",
+      "authorization": {
+        "type": "bearer",
+        "scheme": "bearer",
+        "credentials": "REPLACE_WITH_ARACHNE_MCP_EXECUTION_TOKEN"
+      }
+    }
+  }
+}

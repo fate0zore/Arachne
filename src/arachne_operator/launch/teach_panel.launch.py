@@ -1,10 +1,20 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import (
+    DeclareLaunchArgument,
+    EmitEvent,
+    IncludeLaunchDescription,
+    RegisterEventHandler,
+)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -14,7 +24,11 @@ def generate_launch_description():
     visualization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
-                [FindPackageShare("arachne_operator"), "launch", "teach_visualization.launch.py"]
+                [
+                    FindPackageShare("arachne_operator"),
+                    "launch",
+                    "teach_visualization.launch.py",
+                ]
             )
         ),
         launch_arguments={
@@ -24,7 +38,9 @@ def generate_launch_description():
             "with_rviz": LaunchConfiguration("visualization_with_rviz"),
             "gripper_type": LaunchConfiguration("visualization_gripper_type"),
             "with_lidar": LaunchConfiguration("visualization_with_lidar"),
-            "with_lslidar_driver": LaunchConfiguration("visualization_with_lslidar_driver"),
+            "with_lslidar_driver": LaunchConfiguration(
+                "visualization_with_lslidar_driver"
+            ),
             "with_ee_camera": LaunchConfiguration("visualization_with_ee_camera"),
             "ee_support_xyz": LaunchConfiguration("visualization_ee_support_xyz"),
             "ee_support_rpy": LaunchConfiguration("visualization_ee_support_rpy"),
@@ -60,7 +76,11 @@ def generate_launch_description():
     real_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
-                [FindPackageShare("arachne_hardware"), "launch", "real_bringup.launch.py"]
+                [
+                    FindPackageShare("arachne_hardware"),
+                    "launch",
+                    "real_bringup.launch.py",
+                ]
             )
         ),
         launch_arguments={
@@ -72,14 +92,18 @@ def generate_launch_description():
             "aubo_rpc_port": LaunchConfiguration("aubo_sdk_rpc_port"),
             "aubo_rpc_timeout_sec": LaunchConfiguration("aubo_sdk_rpc_timeout_sec"),
             "aubo_teach_flag_path": LaunchConfiguration("aubo_sdk_teach_flag_path"),
-            "aubo_control_owner_path": LaunchConfiguration("aubo_sdk_control_owner_path"),
+            "aubo_control_owner_path": LaunchConfiguration(
+                "aubo_sdk_control_owner_path"
+            ),
             "aubo_teach_control_owner_name": LaunchConfiguration(
                 "aubo_sdk_control_owner_name"
             ),
             "aubo_sdk_velocity_control_owner_name": LaunchConfiguration(
                 "aubo_sdk_control_owner_name"
             ),
-            "aubo_move_joint_action_name": LaunchConfiguration("aubo_move_joint_action_name"),
+            "aubo_move_joint_action_name": LaunchConfiguration(
+                "aubo_move_joint_action_name"
+            ),
             "aubo_sdk_move_joint_speed_rad_sec": LaunchConfiguration(
                 "aubo_sdk_move_speed_rad_sec"
             ),
@@ -126,7 +150,11 @@ def generate_launch_description():
     demo_orchestrator = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
-                [FindPackageShare("arachne_operator"), "launch", "demo_orchestrator.launch.py"]
+                [
+                    FindPackageShare("arachne_operator"),
+                    "launch",
+                    "demo_orchestrator.launch.py",
+                ]
             )
         ),
         launch_arguments={
@@ -135,12 +163,20 @@ def generate_launch_description():
             "odom_topic": LaunchConfiguration("odom_topic"),
             "gripper_command_topic": LaunchConfiguration("gripper_command_topic"),
             "aubo_teach_command_topic": LaunchConfiguration("aubo_teach_command_topic"),
-            "aubo_move_joint_action_name": LaunchConfiguration("aubo_move_joint_action_name"),
+            "aubo_move_joint_action_name": LaunchConfiguration(
+                "aubo_move_joint_action_name"
+            ),
             "grasp_task_start_service": LaunchConfiguration("grasp_task_start_service"),
             "grasp_task_stop_service": LaunchConfiguration("grasp_task_stop_service"),
-            "grasp_task_preflight_service": LaunchConfiguration("grasp_task_preflight_service"),
-            "cleanup_task_start_service": LaunchConfiguration("cleanup_task_start_service"),
-            "cleanup_task_stop_service": LaunchConfiguration("cleanup_task_stop_service"),
+            "grasp_task_preflight_service": LaunchConfiguration(
+                "grasp_task_preflight_service"
+            ),
+            "cleanup_task_start_service": LaunchConfiguration(
+                "cleanup_task_start_service"
+            ),
+            "cleanup_task_stop_service": LaunchConfiguration(
+                "cleanup_task_stop_service"
+            ),
             "cleanup_task_preflight_service": LaunchConfiguration(
                 "cleanup_task_preflight_service"
             ),
@@ -175,7 +211,9 @@ def generate_launch_description():
                     "legacy_arm_trajectory_topic"
                 ),
                 "arm_state_joint_names": LaunchConfiguration("arm_state_joint_names"),
-                "arm_command_joint_names": LaunchConfiguration("arm_command_joint_names"),
+                "arm_command_joint_names": LaunchConfiguration(
+                    "arm_command_joint_names"
+                ),
                 "gripper_command_topic": LaunchConfiguration("gripper_command_topic"),
                 "aubo_teach_command_topic": LaunchConfiguration(
                     "aubo_teach_command_topic"
@@ -202,7 +240,8 @@ def generate_launch_description():
                     LaunchConfiguration("base_motion_max_segment_sec"), value_type=float
                 ),
                 "base_ignore_spurious_zero_odom": ParameterValue(
-                    LaunchConfiguration("base_ignore_spurious_zero_odom"), value_type=bool
+                    LaunchConfiguration("base_ignore_spurious_zero_odom"),
+                    value_type=bool,
                 ),
                 "arm_jog_step_m": ParameterValue(
                     LaunchConfiguration("arm_jog_step_m"), value_type=float
@@ -238,34 +277,43 @@ def generate_launch_description():
                     LaunchConfiguration("arm_joint_jog_speed_rad_sec"), value_type=float
                 ),
                 "arm_cartesian_jog_speed_m_sec": ParameterValue(
-                    LaunchConfiguration("arm_cartesian_jog_speed_m_sec"), value_type=float
+                    LaunchConfiguration("arm_cartesian_jog_speed_m_sec"),
+                    value_type=float,
                 ),
                 "arm_cartesian_rotate_speed_rad_sec": ParameterValue(
-                    LaunchConfiguration("arm_cartesian_rotate_speed_rad_sec"), value_type=float
+                    LaunchConfiguration("arm_cartesian_rotate_speed_rad_sec"),
+                    value_type=float,
                 ),
                 "arm_velocity_damping": ParameterValue(
                     LaunchConfiguration("arm_velocity_damping"), value_type=float
                 ),
                 "arm_velocity_max_joint_speed_rad_sec": ParameterValue(
-                    LaunchConfiguration("arm_velocity_max_joint_speed_rad_sec"), value_type=float
+                    LaunchConfiguration("arm_velocity_max_joint_speed_rad_sec"),
+                    value_type=float,
                 ),
                 "arm_velocity_max_joint_accel_rad_sec2": ParameterValue(
-                    LaunchConfiguration("arm_velocity_max_joint_accel_rad_sec2"), value_type=float
+                    LaunchConfiguration("arm_velocity_max_joint_accel_rad_sec2"),
+                    value_type=float,
                 ),
                 "arm_velocity_max_joint_jerk_rad_sec3": ParameterValue(
-                    LaunchConfiguration("arm_velocity_max_joint_jerk_rad_sec3"), value_type=float
+                    LaunchConfiguration("arm_velocity_max_joint_jerk_rad_sec3"),
+                    value_type=float,
                 ),
                 "arm_velocity_smoothing_tau_sec": ParameterValue(
-                    LaunchConfiguration("arm_velocity_smoothing_tau_sec"), value_type=float
+                    LaunchConfiguration("arm_velocity_smoothing_tau_sec"),
+                    value_type=float,
                 ),
                 "arm_velocity_keepout_predict_sec": ParameterValue(
-                    LaunchConfiguration("arm_velocity_keepout_predict_sec"), value_type=float
+                    LaunchConfiguration("arm_velocity_keepout_predict_sec"),
+                    value_type=float,
                 ),
                 "arm_velocity_keepout_check_interval_sec": ParameterValue(
-                    LaunchConfiguration("arm_velocity_keepout_check_interval_sec"), value_type=float
+                    LaunchConfiguration("arm_velocity_keepout_check_interval_sec"),
+                    value_type=float,
                 ),
                 "arm_velocity_stream_deadman_sec": ParameterValue(
-                    LaunchConfiguration("arm_velocity_stream_deadman_sec"), value_type=float
+                    LaunchConfiguration("arm_velocity_stream_deadman_sec"),
+                    value_type=float,
                 ),
                 "arm_waypoint_duration_sec": ParameterValue(
                     LaunchConfiguration("arm_waypoint_duration_sec"), value_type=float
@@ -282,7 +330,8 @@ def generate_launch_description():
                     LaunchConfiguration("aubo_sdk_move_speed_rad_sec"), value_type=float
                 ),
                 "aubo_sdk_move_accel_rad_sec2": ParameterValue(
-                    LaunchConfiguration("aubo_sdk_move_accel_rad_sec2"), value_type=float
+                    LaunchConfiguration("aubo_sdk_move_accel_rad_sec2"),
+                    value_type=float,
                 ),
                 "aubo_sdk_blend_radius": ParameterValue(
                     LaunchConfiguration("aubo_sdk_blend_radius"), value_type=float
@@ -294,21 +343,32 @@ def generate_launch_description():
                     LaunchConfiguration("aubo_sdk_goal_tolerance_rad"), value_type=float
                 ),
                 "aubo_sdk_arrival_timeout_padding_sec": ParameterValue(
-                    LaunchConfiguration("aubo_sdk_arrival_timeout_padding_sec"), value_type=float
+                    LaunchConfiguration("aubo_sdk_arrival_timeout_padding_sec"),
+                    value_type=float,
                 ),
                 "aubo_sdk_lifecycle_power_timeout_sec": ParameterValue(
-                    LaunchConfiguration("aubo_sdk_lifecycle_power_timeout_sec"), value_type=float
+                    LaunchConfiguration("aubo_sdk_lifecycle_power_timeout_sec"),
+                    value_type=float,
                 ),
                 "aubo_sdk_lifecycle_startup_timeout_sec": ParameterValue(
-                    LaunchConfiguration("aubo_sdk_lifecycle_startup_timeout_sec"), value_type=float
+                    LaunchConfiguration("aubo_sdk_lifecycle_startup_timeout_sec"),
+                    value_type=float,
                 ),
                 "aubo_sdk_lifecycle_poll_sec": ParameterValue(
                     LaunchConfiguration("aubo_sdk_lifecycle_poll_sec"), value_type=float
                 ),
-                "aubo_sdk_teach_flag_path": LaunchConfiguration("aubo_sdk_teach_flag_path"),
-                "aubo_sdk_control_owner_path": LaunchConfiguration("aubo_sdk_control_owner_path"),
-                "aubo_sdk_control_owner_name": LaunchConfiguration("aubo_sdk_control_owner_name"),
-                "aubo_move_joint_action_name": LaunchConfiguration("aubo_move_joint_action_name"),
+                "aubo_sdk_teach_flag_path": LaunchConfiguration(
+                    "aubo_sdk_teach_flag_path"
+                ),
+                "aubo_sdk_control_owner_path": LaunchConfiguration(
+                    "aubo_sdk_control_owner_path"
+                ),
+                "aubo_sdk_control_owner_name": LaunchConfiguration(
+                    "aubo_sdk_control_owner_name"
+                ),
+                "aubo_move_joint_action_name": LaunchConfiguration(
+                    "aubo_move_joint_action_name"
+                ),
                 "aubo_move_joint_action_timeout_sec": ParameterValue(
                     LaunchConfiguration("aubo_move_joint_action_timeout_sec"),
                     value_type=float,
@@ -334,7 +394,9 @@ def generate_launch_description():
                 "demo_pause_road_cleanup_service": LaunchConfiguration(
                     "demo_pause_road_cleanup_service"
                 ),
-                "demo_return_home_service": LaunchConfiguration("demo_return_home_service"),
+                "demo_return_home_service": LaunchConfiguration(
+                    "demo_return_home_service"
+                ),
                 "demo_stop_service": LaunchConfiguration("demo_stop_service"),
                 "demo_preflight_service": LaunchConfiguration("demo_preflight_service"),
                 "demo_status_service": LaunchConfiguration("demo_status_service"),
@@ -349,7 +411,8 @@ def generate_launch_description():
                     LaunchConfiguration("arm_orientation_tolerance"), value_type=float
                 ),
                 "arm_jog_orientation_tolerance": ParameterValue(
-                    LaunchConfiguration("arm_jog_orientation_tolerance"), value_type=float
+                    LaunchConfiguration("arm_jog_orientation_tolerance"),
+                    value_type=float,
                 ),
                 "arm_keepout_enabled": ParameterValue(
                     LaunchConfiguration("arm_keepout_enabled"), value_type=bool
@@ -392,41 +455,90 @@ def generate_launch_description():
                 ),
                 "workspace_root": LaunchConfiguration("workspace_root"),
                 "runtime_log_root": LaunchConfiguration("runtime_log_root"),
-                "autostart_managed_processes": LaunchConfiguration("autostart_managed_processes"),
+                "autostart_managed_processes": PythonExpression(
+                    [
+                        "'",
+                        LaunchConfiguration("autostart_managed_processes"),
+                        "' + ',mcp_servers' if '",
+                        LaunchConfiguration("enable_mcp"),
+                        "' == 'true' else '",
+                        LaunchConfiguration("autostart_managed_processes"),
+                        "'",
+                    ]
+                ),
+                "mcp_servers_server_command": LaunchConfiguration(
+                    "mcp_servers_server_command"
+                ),
                 "service_stop_timeout_sec": ParameterValue(
                     LaunchConfiguration("service_stop_timeout_sec"), value_type=float
                 ),
                 "camera_command": LaunchConfiguration("camera_command"),
-                "depth_pointcloud_command": LaunchConfiguration("depth_pointcloud_command"),
+                "depth_pointcloud_command": LaunchConfiguration(
+                    "depth_pointcloud_command"
+                ),
                 "camera_view_command": LaunchConfiguration("camera_view_command"),
                 "yolo_view_command": LaunchConfiguration("yolo_view_command"),
                 "slam_command": LaunchConfiguration("slam_command"),
                 "grasp_server_command": LaunchConfiguration("grasp_server_command"),
                 "cleanup_server_command": LaunchConfiguration("cleanup_server_command"),
-                "step_cleanup_server_command": LaunchConfiguration("step_cleanup_server_command"),
-                "hand_eye_calibrator_command": LaunchConfiguration("hand_eye_calibrator_command"),
+                "step_cleanup_server_command": LaunchConfiguration(
+                    "step_cleanup_server_command"
+                ),
+                "hand_eye_calibrator_command": LaunchConfiguration(
+                    "hand_eye_calibrator_command"
+                ),
                 "grasp_task_state_topic": LaunchConfiguration("grasp_task_state_topic"),
-                "grasp_task_start_service": LaunchConfiguration("grasp_task_start_service"),
-                "grasp_task_stop_service": LaunchConfiguration("grasp_task_stop_service"),
-                "grasp_task_restore_service": LaunchConfiguration("grasp_task_restore_service"),
-                "grasp_task_status_service": LaunchConfiguration("grasp_task_status_service"),
-                "cleanup_task_state_topic": LaunchConfiguration("cleanup_task_state_topic"),
-                "cleanup_task_start_service": LaunchConfiguration("cleanup_task_start_service"),
-                "cleanup_task_pause_service": LaunchConfiguration("cleanup_task_pause_service"),
+                "grasp_task_start_service": LaunchConfiguration(
+                    "grasp_task_start_service"
+                ),
+                "grasp_task_stop_service": LaunchConfiguration(
+                    "grasp_task_stop_service"
+                ),
+                "grasp_task_restore_service": LaunchConfiguration(
+                    "grasp_task_restore_service"
+                ),
+                "grasp_task_status_service": LaunchConfiguration(
+                    "grasp_task_status_service"
+                ),
+                "cleanup_task_state_topic": LaunchConfiguration(
+                    "cleanup_task_state_topic"
+                ),
+                "cleanup_task_start_service": LaunchConfiguration(
+                    "cleanup_task_start_service"
+                ),
+                "cleanup_task_pause_service": LaunchConfiguration(
+                    "cleanup_task_pause_service"
+                ),
                 "cleanup_task_return_home_service": LaunchConfiguration(
                     "cleanup_task_return_home_service"
                 ),
-                "cleanup_task_stop_service": LaunchConfiguration("cleanup_task_stop_service"),
-            "cleanup_task_status_service": LaunchConfiguration("cleanup_task_status_service"),
-            "cleanup_task_preflight_service": LaunchConfiguration("cleanup_task_preflight_service"),
-            "step_cleanup_state_topic": LaunchConfiguration("step_cleanup_state_topic"),
-            "step_cleanup_start_service": LaunchConfiguration("step_cleanup_start_service"),
-            "step_cleanup_stop_service": LaunchConfiguration("step_cleanup_stop_service"),
-            "step_cleanup_status_service": LaunchConfiguration("step_cleanup_status_service"),
-            "step_cleanup_preflight_service": LaunchConfiguration("step_cleanup_preflight_service"),
-        }
-    ],
-)
+                "cleanup_task_stop_service": LaunchConfiguration(
+                    "cleanup_task_stop_service"
+                ),
+                "cleanup_task_status_service": LaunchConfiguration(
+                    "cleanup_task_status_service"
+                ),
+                "cleanup_task_preflight_service": LaunchConfiguration(
+                    "cleanup_task_preflight_service"
+                ),
+                "step_cleanup_state_topic": LaunchConfiguration(
+                    "step_cleanup_state_topic"
+                ),
+                "step_cleanup_start_service": LaunchConfiguration(
+                    "step_cleanup_start_service"
+                ),
+                "step_cleanup_stop_service": LaunchConfiguration(
+                    "step_cleanup_stop_service"
+                ),
+                "step_cleanup_status_service": LaunchConfiguration(
+                    "step_cleanup_status_service"
+                ),
+                "step_cleanup_preflight_service": LaunchConfiguration(
+                    "step_cleanup_preflight_service"
+                ),
+            }
+        ],
+    )
 
     return LaunchDescription(
         [
@@ -443,18 +555,29 @@ def generate_launch_description():
             DeclareLaunchArgument("visualization_with_rviz", default_value="true"),
             DeclareLaunchArgument("visualization_gripper_type", default_value="ms42dc"),
             DeclareLaunchArgument("visualization_with_lidar", default_value="true"),
-            DeclareLaunchArgument("visualization_with_lslidar_driver", default_value="false"),
+            DeclareLaunchArgument(
+                "visualization_with_lslidar_driver", default_value="false"
+            ),
             DeclareLaunchArgument("visualization_with_ee_camera", default_value="true"),
-            DeclareLaunchArgument("visualization_ee_support_xyz", default_value="0.0 0.0 0.0"),
-            DeclareLaunchArgument("visualization_ee_support_rpy", default_value="0.0 0.0 2.35619449019"),
-            DeclareLaunchArgument("visualization_tool_adapter_xyz", default_value="-0.049334103 0.049874070 0.021816675"),
+            DeclareLaunchArgument(
+                "visualization_ee_support_xyz", default_value="0.0 0.0 0.0"
+            ),
+            DeclareLaunchArgument(
+                "visualization_ee_support_rpy", default_value="0.0 0.0 2.35619449019"
+            ),
+            DeclareLaunchArgument(
+                "visualization_tool_adapter_xyz",
+                default_value="-0.049334103 0.049874070 0.021816675",
+            ),
             DeclareLaunchArgument(
                 "visualization_tool_adapter_rpy",
                 default_value="1.570796327 0.0 0.0",
             ),
             DeclareLaunchArgument("with_camera", default_value="false"),
             DeclareLaunchArgument("camera_color_device", default_value="/dev/video6"),
-            DeclareLaunchArgument("camera_color_capture_mode", default_value="v4l2-ctl"),
+            DeclareLaunchArgument(
+                "camera_color_capture_mode", default_value="v4l2-ctl"
+            ),
             DeclareLaunchArgument("camera_color_fourcc", default_value="YUYV"),
             DeclareLaunchArgument("camera_depth_device", default_value="/dev/video0"),
             DeclareLaunchArgument("camera_with_color_view", default_value="false"),
@@ -462,7 +585,9 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_publish_depth", default_value="false"),
             DeclareLaunchArgument("camera_publish_depth_color", default_value="false"),
             DeclareLaunchArgument("camera_publish_pointcloud", default_value="false"),
-            DeclareLaunchArgument("camera_parent_frame", default_value="ee_camera_link"),
+            DeclareLaunchArgument(
+                "camera_parent_frame", default_value="ee_camera_link"
+            ),
             DeclareLaunchArgument("camera_projection_flip_x", default_value="true"),
             DeclareLaunchArgument("camera_projection_flip_y", default_value="true"),
             DeclareLaunchArgument("with_real_bringup", default_value="true"),
@@ -470,9 +595,12 @@ def generate_launch_description():
                 "arm_follow_joint_trajectory_action",
                 default_value="/joint_trajectory_controller/follow_joint_trajectory",
             ),
-            DeclareLaunchArgument("moveit_plan_service", default_value="/plan_kinematic_path"),
             DeclareLaunchArgument(
-                "moveit_joint_states_topic", default_value="/arachne/moveit/joint_states"
+                "moveit_plan_service", default_value="/plan_kinematic_path"
+            ),
+            DeclareLaunchArgument(
+                "moveit_joint_states_topic",
+                default_value="/arachne/moveit/joint_states",
             ),
             DeclareLaunchArgument(
                 "arm_trajectory_topic",
@@ -496,7 +624,9 @@ def generate_launch_description():
                     "wrist1_joint,wrist2_joint,wrist3_joint"
                 ),
             ),
-            DeclareLaunchArgument("gripper_command_topic", default_value="/arachne/gripper/command"),
+            DeclareLaunchArgument(
+                "gripper_command_topic", default_value="/arachne/gripper/command"
+            ),
             DeclareLaunchArgument(
                 "aubo_teach_command_topic",
                 default_value="/arachne/aubo/teach_command",
@@ -507,7 +637,9 @@ def generate_launch_description():
             DeclareLaunchArgument("base_replay_angular_speed", default_value="0.48"),
             DeclareLaunchArgument("base_manual_publish_rate", default_value="12.0"),
             DeclareLaunchArgument("base_motion_max_segment_sec", default_value="20.0"),
-            DeclareLaunchArgument("base_ignore_spurious_zero_odom", default_value="true"),
+            DeclareLaunchArgument(
+                "base_ignore_spurious_zero_odom", default_value="true"
+            ),
             DeclareLaunchArgument("arm_jog_step_m", default_value="0.008"),
             DeclareLaunchArgument("arm_jog_duration_sec", default_value="0.06"),
             DeclareLaunchArgument("arm_rotate_step_rad", default_value="0.0122173"),
@@ -522,21 +654,41 @@ def generate_launch_description():
             DeclareLaunchArgument("arm_velocity_publish_rate", default_value="80.0"),
             DeclareLaunchArgument("arm_velocity_watchdog_sec", default_value="0.20"),
             DeclareLaunchArgument("arm_joint_jog_speed_rad_sec", default_value="0.32"),
-            DeclareLaunchArgument("arm_cartesian_jog_speed_m_sec", default_value="0.10"),
-            DeclareLaunchArgument("arm_cartesian_rotate_speed_rad_sec", default_value="0.32"),
+            DeclareLaunchArgument(
+                "arm_cartesian_jog_speed_m_sec", default_value="0.10"
+            ),
+            DeclareLaunchArgument(
+                "arm_cartesian_rotate_speed_rad_sec", default_value="0.32"
+            ),
             DeclareLaunchArgument("arm_velocity_damping", default_value="0.08"),
-            DeclareLaunchArgument("arm_velocity_max_joint_speed_rad_sec", default_value="1.00"),
-            DeclareLaunchArgument("arm_velocity_max_joint_accel_rad_sec2", default_value="1.60"),
-            DeclareLaunchArgument("arm_velocity_max_joint_jerk_rad_sec3", default_value="24.0"),
-            DeclareLaunchArgument("arm_velocity_smoothing_tau_sec", default_value="0.08"),
-            DeclareLaunchArgument("arm_velocity_keepout_predict_sec", default_value="0.35"),
-            DeclareLaunchArgument("arm_velocity_keepout_check_interval_sec", default_value="0.05"),
-            DeclareLaunchArgument("arm_velocity_stream_deadman_sec", default_value="0.75"),
+            DeclareLaunchArgument(
+                "arm_velocity_max_joint_speed_rad_sec", default_value="1.00"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_max_joint_accel_rad_sec2", default_value="1.60"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_max_joint_jerk_rad_sec3", default_value="24.0"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_smoothing_tau_sec", default_value="0.08"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_keepout_predict_sec", default_value="0.35"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_keepout_check_interval_sec", default_value="0.05"
+            ),
+            DeclareLaunchArgument(
+                "arm_velocity_stream_deadman_sec", default_value="0.75"
+            ),
             DeclareLaunchArgument("arm_waypoint_duration_sec", default_value="0.9375"),
             DeclareLaunchArgument("arm_replay_backend", default_value="sdk_move_joint"),
             DeclareLaunchArgument(
                 "aubo_sdk_ip",
-                default_value=EnvironmentVariable("AUBO_ROBOT_IP", default_value="192.168.127.128"),
+                default_value=EnvironmentVariable(
+                    "AUBO_ROBOT_IP", default_value="192.168.127.128"
+                ),
             ),
             DeclareLaunchArgument("aubo_sdk_rpc_port", default_value="30004"),
             DeclareLaunchArgument("aubo_sdk_rpc_timeout_sec", default_value="3.0"),
@@ -545,9 +697,15 @@ def generate_launch_description():
             DeclareLaunchArgument("aubo_sdk_blend_radius", default_value="0.0"),
             DeclareLaunchArgument("aubo_sdk_move_duration_sec", default_value="0.0"),
             DeclareLaunchArgument("aubo_sdk_goal_tolerance_rad", default_value="0.04"),
-            DeclareLaunchArgument("aubo_sdk_arrival_timeout_padding_sec", default_value="3.0"),
-            DeclareLaunchArgument("aubo_sdk_lifecycle_power_timeout_sec", default_value="45.0"),
-            DeclareLaunchArgument("aubo_sdk_lifecycle_startup_timeout_sec", default_value="45.0"),
+            DeclareLaunchArgument(
+                "aubo_sdk_arrival_timeout_padding_sec", default_value="3.0"
+            ),
+            DeclareLaunchArgument(
+                "aubo_sdk_lifecycle_power_timeout_sec", default_value="45.0"
+            ),
+            DeclareLaunchArgument(
+                "aubo_sdk_lifecycle_startup_timeout_sec", default_value="45.0"
+            ),
             DeclareLaunchArgument("aubo_sdk_lifecycle_poll_sec", default_value="0.5"),
             DeclareLaunchArgument(
                 "aubo_sdk_teach_flag_path",
@@ -557,17 +715,25 @@ def generate_launch_description():
                 "aubo_sdk_control_owner_path",
                 default_value="/tmp/arachne_aubo_control_owner",
             ),
-            DeclareLaunchArgument("aubo_sdk_control_owner_name", default_value="teach_panel"),
+            DeclareLaunchArgument(
+                "aubo_sdk_control_owner_name", default_value="teach_panel"
+            ),
             DeclareLaunchArgument(
                 "aubo_move_joint_action_name",
                 default_value="/arachne/aubo/move_joint",
             ),
-            DeclareLaunchArgument("aubo_move_joint_action_timeout_sec", default_value="0.5"),
-            DeclareLaunchArgument("aubo_move_joint_fallback_internal", default_value="false"),
+            DeclareLaunchArgument(
+                "aubo_move_joint_action_timeout_sec", default_value="0.5"
+            ),
+            DeclareLaunchArgument(
+                "aubo_move_joint_fallback_internal", default_value="false"
+            ),
             DeclareLaunchArgument("with_demo_orchestrator", default_value="true"),
             DeclareLaunchArgument("with_moveit_planning", default_value="true"),
             DeclareLaunchArgument("demo_orchestrator_enabled", default_value="true"),
-            DeclareLaunchArgument("demo_orchestrator_fallback_internal", default_value="true"),
+            DeclareLaunchArgument(
+                "demo_orchestrator_fallback_internal", default_value="true"
+            ),
             DeclareLaunchArgument(
                 "demo_start_visual_grasp_service",
                 default_value="/arachne/demo/start_visual_grasp",
@@ -584,19 +750,35 @@ def generate_launch_description():
                 "demo_return_home_service",
                 default_value="/arachne/demo/return_home",
             ),
-            DeclareLaunchArgument("demo_stop_service", default_value="/arachne/demo/stop"),
-            DeclareLaunchArgument("demo_preflight_service", default_value="/arachne/demo/preflight"),
-            DeclareLaunchArgument("demo_status_service", default_value="/arachne/demo/status"),
-            DeclareLaunchArgument("demo_state_topic", default_value="/arachne/demo/state"),
+            DeclareLaunchArgument(
+                "demo_stop_service", default_value="/arachne/demo/stop"
+            ),
+            DeclareLaunchArgument(
+                "demo_preflight_service", default_value="/arachne/demo/preflight"
+            ),
+            DeclareLaunchArgument(
+                "demo_status_service", default_value="/arachne/demo/status"
+            ),
+            DeclareLaunchArgument(
+                "demo_state_topic", default_value="/arachne/demo/state"
+            ),
             DeclareLaunchArgument("gripper_settle_sec", default_value="2.0"),
             DeclareLaunchArgument("arm_jog_position_tolerance", default_value="0.0008"),
             DeclareLaunchArgument("arm_orientation_tolerance", default_value="0.01"),
-            DeclareLaunchArgument("arm_jog_orientation_tolerance", default_value="0.004"),
+            DeclareLaunchArgument(
+                "arm_jog_orientation_tolerance", default_value="0.004"
+            ),
             DeclareLaunchArgument("arm_keepout_enabled", default_value="true"),
             DeclareLaunchArgument("arm_base_xyz", default_value="0.22,0.0,0.105"),
-            DeclareLaunchArgument("arm_base_rpy", default_value="0.0,0.0,1.57079632679"),
-            DeclareLaunchArgument("rear_rack_keepout_min_xyz", default_value="-0.41,-0.22,0.04"),
-            DeclareLaunchArgument("rear_rack_keepout_max_xyz", default_value="0.09,0.22,0.82"),
+            DeclareLaunchArgument(
+                "arm_base_rpy", default_value="0.0,0.0,1.57079632679"
+            ),
+            DeclareLaunchArgument(
+                "rear_rack_keepout_min_xyz", default_value="-0.41,-0.22,0.04"
+            ),
+            DeclareLaunchArgument(
+                "rear_rack_keepout_max_xyz", default_value="0.09,0.22,0.82"
+            ),
             DeclareLaunchArgument(
                 "front_basket_keepout_min_xyz", default_value="0.4215,-0.11,-0.1235"
             ),
@@ -614,7 +796,9 @@ def generate_launch_description():
                 default_value="-90.00,11.55,95.09,27.80,96.07,43.79",
             ),
             DeclareLaunchArgument("aubo_payload_mass_kg", default_value="0.818"),
-            DeclareLaunchArgument("aubo_payload_cog", default_value="0.039927,0.045067,0.143233"),
+            DeclareLaunchArgument(
+                "aubo_payload_cog", default_value="0.039927,0.045067,0.143233"
+            ),
             DeclareLaunchArgument("aubo_payload_aom", default_value="0,0,0"),
             DeclareLaunchArgument("aubo_payload_inertia", default_value="0,0,0,0,0,0"),
             DeclareLaunchArgument("arm_goal_tolerance", default_value="0.04"),
@@ -629,7 +813,7 @@ def generate_launch_description():
             DeclareLaunchArgument("runtime_log_root", default_value="log/teach_panel"),
             DeclareLaunchArgument(
                 "autostart_managed_processes",
-                default_value="camera,depth_pointcloud,viewer,grasp_server,cleanup_server",
+                default_value="camera,depth_pointcloud,viewer,grasp_server,cleanup_server,viewpoint_planner",
             ),
             DeclareLaunchArgument("service_stop_timeout_sec", default_value="4.0"),
             DeclareLaunchArgument(
@@ -652,14 +836,14 @@ def generate_launch_description():
                 "camera_view_command",
                 default_value=(
                     "ros2 run arachne_operator raw_image_viewer "
-                    "--topic /camera/color/image_raw --window \"Arachne Raw Camera\" --max-fps 30"
+                    '--topic /camera/color/image_raw --window "Arachne Raw Camera" --max-fps 30'
                 ),
             ),
             DeclareLaunchArgument(
                 "yolo_view_command",
                 default_value=(
                     "ros2 run arachne_operator raw_image_viewer "
-                    "--topic /camera/color/image_raw --window \"智慧出行\" --max-fps 30 "
+                    '--topic /camera/color/image_raw --window "智慧出行" --max-fps 30 '
                     "--yolo-model yolo_workspace/weights/trash_yolo26n_seg_best.onnx "
                     "--yolo-task segment --yolo-imgsz 640 --yolo-conf 0.25 --yolo-every 5 "
                     "--yolo-device cpu --yolo-venv yolo_workspace/.venv"
@@ -747,28 +931,86 @@ def generate_launch_description():
                 "hand_eye_calibrator_command",
                 default_value="ros2 run arachne_operator apriltag_hand_eye_calibrator",
             ),
-            DeclareLaunchArgument("grasp_task_state_topic", default_value="/arachne/grasp_task/state"),
-            DeclareLaunchArgument("grasp_task_start_service", default_value="/arachne/grasp_task/start"),
-            DeclareLaunchArgument("grasp_task_stop_service", default_value="/arachne/grasp_task/stop"),
+            DeclareLaunchArgument("enable_mcp", default_value="false"),
             DeclareLaunchArgument(
-                "grasp_task_restore_service", default_value="/arachne/grasp_task/restore"
+                "mcp_servers_server_command",
+                default_value=(
+                    "ros2 run arachne_mcp mcp_servers --ros-args "
+                    "-p mcp_bind_host:=${ARACHNE_MCP_BIND_HOST:-0.0.0.0} "
+                    "-p mcp_port:=8123 "
+                    "-p mcp_planner_token:=${ARACHNE_MCP_PLANNER_TOKEN:-} "
+                    "-p mcp_execution_token:=${ARACHNE_MCP_EXECUTION_TOKEN:-} "
+                    "-p mcp_allowed_hosts:=${ARACHNE_MCP_ALLOWED_HOSTS:-} "
+                    "-p motion_enabled:=false -p confirm_agent_motion:=false "
+                    "-p teach_config_autoload:=false "
+                    "-p runtime_log_root:=log/arachne_execution_mcp "
+                    "-p viewpoint_plan_share_dir:=log/viewpoint_plans"
+                ),
             ),
-            DeclareLaunchArgument("grasp_task_status_service", default_value="/arachne/grasp_task/status"),
-            DeclareLaunchArgument("grasp_task_preflight_service", default_value="/arachne/grasp_task/preflight"),
-            DeclareLaunchArgument("cleanup_task_state_topic", default_value="/arachne/road_cleanup/state"),
-            DeclareLaunchArgument("cleanup_task_start_service", default_value="/arachne/road_cleanup/start"),
-            DeclareLaunchArgument("cleanup_task_pause_service", default_value="/arachne/road_cleanup/pause"),
             DeclareLaunchArgument(
-                "cleanup_task_return_home_service", default_value="/arachne/road_cleanup/return_home"
+                "grasp_task_state_topic", default_value="/arachne/grasp_task/state"
             ),
-            DeclareLaunchArgument("cleanup_task_stop_service", default_value="/arachne/road_cleanup/stop"),
-            DeclareLaunchArgument("cleanup_task_status_service", default_value="/arachne/road_cleanup/status"),
-            DeclareLaunchArgument("cleanup_task_preflight_service", default_value="/arachne/road_cleanup/preflight"),
-            DeclareLaunchArgument("step_cleanup_state_topic", default_value="/arachne/step_cleanup/state"),
-            DeclareLaunchArgument("step_cleanup_start_service", default_value="/arachne/step_cleanup/start"),
-            DeclareLaunchArgument("step_cleanup_stop_service", default_value="/arachne/step_cleanup/stop"),
-            DeclareLaunchArgument("step_cleanup_status_service", default_value="/arachne/step_cleanup/status"),
-            DeclareLaunchArgument("step_cleanup_preflight_service", default_value="/arachne/step_cleanup/preflight"),
+            DeclareLaunchArgument(
+                "grasp_task_start_service", default_value="/arachne/grasp_task/start"
+            ),
+            DeclareLaunchArgument(
+                "grasp_task_stop_service", default_value="/arachne/grasp_task/stop"
+            ),
+            DeclareLaunchArgument(
+                "grasp_task_restore_service",
+                default_value="/arachne/grasp_task/restore",
+            ),
+            DeclareLaunchArgument(
+                "grasp_task_status_service", default_value="/arachne/grasp_task/status"
+            ),
+            DeclareLaunchArgument(
+                "grasp_task_preflight_service",
+                default_value="/arachne/grasp_task/preflight",
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_state_topic", default_value="/arachne/road_cleanup/state"
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_start_service",
+                default_value="/arachne/road_cleanup/start",
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_pause_service",
+                default_value="/arachne/road_cleanup/pause",
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_return_home_service",
+                default_value="/arachne/road_cleanup/return_home",
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_stop_service", default_value="/arachne/road_cleanup/stop"
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_status_service",
+                default_value="/arachne/road_cleanup/status",
+            ),
+            DeclareLaunchArgument(
+                "cleanup_task_preflight_service",
+                default_value="/arachne/road_cleanup/preflight",
+            ),
+            DeclareLaunchArgument(
+                "step_cleanup_state_topic", default_value="/arachne/step_cleanup/state"
+            ),
+            DeclareLaunchArgument(
+                "step_cleanup_start_service",
+                default_value="/arachne/step_cleanup/start",
+            ),
+            DeclareLaunchArgument(
+                "step_cleanup_stop_service", default_value="/arachne/step_cleanup/stop"
+            ),
+            DeclareLaunchArgument(
+                "step_cleanup_status_service",
+                default_value="/arachne/step_cleanup/status",
+            ),
+            DeclareLaunchArgument(
+                "step_cleanup_preflight_service",
+                default_value="/arachne/step_cleanup/preflight",
+            ),
             visualization,
             camera,
             real_bringup,

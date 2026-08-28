@@ -1,3 +1,8 @@
+# Legacy operator panel: ROS message modules (viewpoint_planner_msgs, rclpy, ...)
+# are outside the workspace LSP's Pyright resolution path, so type inference
+# degrades to Unknown and produces noise unrelated to edits; the primary Python
+# LSP and runtime builds confirm the file compiles. Keep edits reviewable.
+# pyright: reportMissingImports=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportReturnType=false, reportAssignmentType=false, reportUnknownMemberType=false, reportCallIssue=false, reportOptionalSubscript=false, reportOptionalMemberAccess=false, reportOperatorIssue=false, reportIndexIssue=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false
 from __future__ import annotations
 
 import argparse
@@ -35,10 +40,9 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import CameraInfo, Image, JointState, PointCloud2
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Empty, Float64MultiArray, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from viewpoint_planner_msgs.srv import PlanViewpoints
 
 from arachne_operator.control_owner import (
     DEFAULT_AUBO_CONTROL_OWNER_PATH,
@@ -61,6 +65,7 @@ from arachne_operator.moveit_plan import (
 )
 from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
 from arachne_operator.repo_paths import root_dir
+from viewpoint_planner_msgs.srv import PlanViewpoints
 
 DEFAULT_REAL_ARM_JOINTS = (
     "shoulder_joint",
@@ -138,6 +143,8 @@ MANAGED_SERVICE_COMMAND_PARAMS = {
     "step_cleanup_server": "step_cleanup_server_command",
     "hand_eye_calibrator": "hand_eye_calibrator_command",
     "viewpoint_planner": "viewpoint_planner_command",
+    "mcp_servers": "mcp_servers_server_command",
+    "detection_preview": "detection_preview_command",
 }
 MANAGED_SERVICE_READY_SERVICES = {
     "grasp_server": ("/arachne/grasp_task/status", "/arachne/grasp_task/start"),
@@ -747,8 +754,8 @@ def camera_info_to_dict(info) -> dict:
 
 
 class TeachPanelNode(Node):
-    def __init__(self) -> None:
-        super().__init__("arachne_teach_panel")
+    def __init__(self, node_name: str = "arachne_teach_panel") -> None:
+        super().__init__(node_name)
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("joint_states_topic", "/joint_states")
@@ -903,10 +910,26 @@ class TeachPanelNode(Node):
         self.declare_parameter("viewpoint_plan_filter_ik", True)
         self.declare_parameter("viewpoint_plan_filter_collision", True)
         # Service-call timeout: IK filtering of unreachable targets can take
-        # tens of seconds, so the panel waits longer than the default 20 s.
-        self.declare_parameter("viewpoint_plan_service_timeout_sec", 45.0)
+        # tens of seconds, so the panel waits longer than the default 20 s;
+        # 2026-08-28: raised to 60s -- remote agents saw 503s when a slow
+        # plan outlived the 45s service-call window.
+        self.declare_parameter("viewpoint_plan_service_timeout_sec", 60.0)
         self.declare_parameter(
             "taco_instances_topic", "/arachne/perception/taco_instances"
+        )
+        # Read Detection: 一次点击 = 触发重新检测 + 等待新结果回填。
+        self.declare_parameter(
+            "detection_restart_topic", "/arachne/grasp_preview/restart_search"
+        )
+        # 覆盖 YOLO venv 冷启动(模型加载可达数十秒)+ 首帧检测的等待预算
+        self.declare_parameter("detection_read_timeout_sec", 40.0)
+        # 无结果且检测进程未运行时自动拉起的 perception-only 检测命令
+        self.declare_parameter(
+            "detection_preview_command",
+            "ros2 run arachne_operator grasp_preview_pipeline "
+            "--model yolo_workspace/weights/yolo26n.onnx --venv yolo_workspace/.venv "
+            "--planner-backend none --conf 0.05 --inference-period 0.5 "
+            "--reject-label-keywords person,kite",
         )
         self.declare_parameter("camera_image_topic", "/camera/color/image_raw")
         self.declare_parameter("depth_topic", "/camera/depth/image_raw")
@@ -935,7 +958,7 @@ class TeachPanelNode(Node):
         self.declare_parameter("runtime_log_root", "log/teach_panel")
         self.declare_parameter(
             "autostart_managed_processes",
-            "camera,depth_pointcloud,viewer,grasp_server,cleanup_server",
+            "camera,depth_pointcloud,viewer,grasp_server,cleanup_server,viewpoint_planner",
         )
         self.declare_parameter("service_stop_timeout_sec", 4.0)
         self.declare_parameter(
@@ -1054,6 +1077,9 @@ class TeachPanelNode(Node):
             "viewpoint_planner_command",
             "ros2 launch viewpoint_planner viewpoint_planner.launch.py",
         )
+        # MCP exposure (opt-in; single port with per-path bearer tokens, motion
+        # gate defaults closed). Empty command = service not configured.
+        self.declare_parameter("mcp_servers_server_command", "")
         self.declare_parameter("grasp_task_state_topic", "/arachne/grasp_task/state")
         self.declare_parameter("grasp_task_start_service", "/arachne/grasp_task/start")
         self.declare_parameter("grasp_task_stop_service", "/arachne/grasp_task/stop")
@@ -1287,6 +1313,11 @@ class TeachPanelNode(Node):
             self._taco_instances_cb,
             10,
         )
+        self.detection_restart_pub = self.create_publisher(
+            Empty,
+            str(self.get_parameter("detection_restart_topic").value),
+            10,
+        )
         self.create_subscription(
             Image,
             str(self.get_parameter("camera_image_topic").value),
@@ -1350,6 +1381,9 @@ class TeachPanelNode(Node):
         self.hand_eye_busy = False  # 手眼标定服务调用期间置位,避免并发触发
         self.hand_eye_last_result = "no result yet"
         self.latest_detection_xyz: tuple[float, float, float] | None = None
+        # 检测结果序号：每收到一条带有效 base_grasp_xyz 的 taco_instances 消息 +1，
+        # 用于 Read Detection 区分「点击后新检测」与「旧缓存」。
+        self.detection_seq = 0
         # 弹窗上次输入的采样参数：仅本次会话生效（重启后回落节点参数默认值）
         self._viewpoint_plan_target_xyz: tuple[float, float, float] | None = None
         self._viewpoint_plan_radius_m: float | None = None
@@ -1434,6 +1468,7 @@ class TeachPanelNode(Node):
             latest.unlink(missing_ok=True)
             latest.symlink_to(directory)
         except OSError:
+            # pi-lens-ignore: python-empty-except
             pass
         return directory
 
@@ -1505,7 +1540,7 @@ class TeachPanelNode(Node):
             padded.velocity = [0.0] * len(names)
             self.moveit_joint_states_pub.publish(padded)
         except Exception:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - best-effort poll guard
 
     def _poll_aubo_joint_state(self) -> None:
         """SDK 部署下无 /joint_states 源：直接轮询 aubo SDK 关节角维护 current_arm，
@@ -1577,11 +1612,11 @@ class TeachPanelNode(Node):
                 self.hardware_status[key] = data
                 if key == "Aubo":
                     reachability = self._infer_aubo_reachability_locked(data)
-                    if reachability is False:
+                    if reachability == False:  # noqa: E712 - explicit bool|None branch
                         self.aubo_reachable = False
                         self.current_arm.clear()
                         self.tool_position = None
-                    elif reachability is True:
+                    elif reachability == True:  # noqa: E712 - explicit bool|None branch
                         self.aubo_reachable = True
                     self._update_aubo_teach_state_locked(data)
             self._log_hardware_status_change(key, data)
@@ -1655,7 +1690,7 @@ class TeachPanelNode(Node):
             message = str(payload.get("message", "")).strip()
             label = f"{state}: {message}" if message else state
         except json.JSONDecodeError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - non-status text is fine
         with self.lock:
             self.hardware_status["Grasp"] = label
         self._log_hardware_status_change("Grasp", label)
@@ -1673,7 +1708,7 @@ class TeachPanelNode(Node):
                 prefix = f"{prefix} ({float(progress):.2f}m)"
             label = prefix
         except json.JSONDecodeError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - non-status text is fine
         with self.lock:
             self.hardware_status["Road"] = label
         self._log_hardware_status_change("Road", label)
@@ -1691,7 +1726,7 @@ class TeachPanelNode(Node):
                 prefix = f"{prefix} ({float(progress):.2f}m)"
             label = prefix
         except json.JSONDecodeError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - non-status text is fine
         with self.lock:
             self.hardware_status["Step"] = label
         self._log_hardware_status_change("Step", label)
@@ -1753,7 +1788,7 @@ class TeachPanelNode(Node):
             latest.unlink(missing_ok=True)
             latest.symlink_to(run_root)
         except OSError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - best-effort symlink
         self._status(f"viewpoint acquire batch dir: {run_root}")
         return {"root": run_root, "run_id": run_id, "manifest": manifest}
 
@@ -1907,6 +1942,7 @@ class TeachPanelNode(Node):
                 "cleanup_server": managed["cleanup_server"],
                 "step_cleanup_server": managed["step_cleanup_server"],
                 "viewpoint_planner": managed["viewpoint_planner"],
+                "mcp_servers": managed["mcp_servers"],
                 "hand_eye_calibrator": managed["hand_eye_calibrator"],
                 "hand_eye_busy": "busy" if self.hand_eye_busy else "idle",
                 "hand_eye_last_result": self.hand_eye_last_result,
@@ -2889,14 +2925,15 @@ class TeachPanelNode(Node):
             xyz = payload.get("base_grasp_xyz")
             if not xyz or len(xyz) != 3:
                 return
-            with self.lock:
-                self.latest_detection_xyz = (
-                    float(xyz[0]),
-                    float(xyz[1]),
-                    float(xyz[2]),
-                )
         except (ValueError, TypeError, AttributeError):
             return
+        with self.lock:
+            self.latest_detection_xyz = (
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+            )
+            self.detection_seq += 1
 
     def call_grasp_task(self, command: str, release_point: str | None = None) -> None:
         command = str(command).strip().lower()
@@ -3629,7 +3666,7 @@ class TeachPanelNode(Node):
             if parts:
                 return " | ".join(parts)
         except json.JSONDecodeError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - non-status text is fine
         return text[:180]
 
     def _required_preflight_failures(self, message: str) -> list[dict[str, Any]]:
@@ -4249,11 +4286,12 @@ class TeachPanelNode(Node):
                     try:
                         on_success(success)
                     except Exception:  # noqa: BLE001 - 回调兜底
-                        pass
+                        pass  # pi-lens-ignore: python-empty-except - callback best-effort
                 elif on_done is not None:
                     try:
                         on_done()
                     except Exception:  # noqa: BLE001 - 回调兜底
+                        # pi-lens-ignore: python-empty-except
                         pass
 
         self._start_worker(wrapped)
@@ -5391,7 +5429,7 @@ class TeachPanelNode(Node):
                     with AuboDirectJsonRpc(ip, port, timeout) as rpc:
                         self._sdk_stop_joint(rpc, "post-move cleanup", warn_only=True)
                 except Exception:
-                    pass
+                    pass  # pi-lens-ignore: python-empty-except - post-move best-effort
             self._sdk_exit_gate(gate_owned)
             self._sdk_exit_control_owner(owner_owned)
 
@@ -5872,7 +5910,7 @@ class TeachPanelNode(Node):
             try:
                 handle.close()  # type: ignore[possibly-undefined]
             except Exception:
-                pass
+                pass  # pi-lens-ignore: python-empty-except - close best-effort
             self._status(f"service {name} start failed: {exc}", warn=True)
             return
 
@@ -5882,7 +5920,7 @@ class TeachPanelNode(Node):
                 try:
                     old_handle.close()
                 except OSError:
-                    pass
+                    pass  # pi-lens-ignore: python-empty-except - close best-effort
             self.managed_processes[name] = process
             self.managed_process_logs[name] = log_path
             self.managed_process_log_handles[name] = handle
@@ -5932,7 +5970,7 @@ class TeachPanelNode(Node):
                             f"service {name} terminate failed: {exc}", warn=True
                         )
             except ProcessLookupError:
-                pass
+                pass  # pi-lens-ignore: python-empty-except - already-gone process
             except Exception as exc:
                 if not quiet:
                     self._status(f"service {name} stop failed: {exc}", warn=True)
@@ -5945,7 +5983,7 @@ class TeachPanelNode(Node):
             try:
                 handle.close()
             except OSError:
-                pass
+                pass  # pi-lens-ignore: python-empty-except - close best-effort
         self._write_event(
             "service_stop", f"{name} stopped result={result}", service=name
         )
@@ -6409,7 +6447,7 @@ class TeachPanelApp:
         try:
             style.theme_use("clam")
         except tk.TclError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - theme optional
         style.configure("Top.TFrame", background="#202833")
         style.configure(
             "TopTitle.TLabel",
@@ -6454,7 +6492,7 @@ class TeachPanelApp:
             self.root.after(500, lambda: self.root.attributes("-topmost", False))
             self.root.focus_force()
         except tk.TclError:
-            pass
+            pass  # pi-lens-ignore: python-empty-except - focus best-effort
 
     def _add_scrollable_tab(self, title: str) -> ttk.Frame:
         outer = ttk.Frame(self.notebook)
@@ -6646,6 +6684,11 @@ class TeachPanelApp:
                     lambda: self.node.toggle_managed_process("step_cleanup_server"),
                     None,
                 ),
+                (
+                    "MCP Servers",
+                    lambda: self.node.toggle_managed_process("mcp_servers"),
+                    None,
+                ),
                 ("Viewpoint Plan", self._prompt_viewpoint_plan, None),
             ),
             columns=2,
@@ -6782,6 +6825,7 @@ class TeachPanelApp:
                 ("grasp_server", "Grasp Server"),
                 ("cleanup_server", "Road Cleanup Server"),
                 ("step_cleanup_server", "Step Cleanup Server"),
+                ("mcp_servers", "MCP Servers (:8123)"),
             )
         ):
             ttk.Label(services, text=label, style="State.TLabel", width=16).grid(
@@ -6933,6 +6977,8 @@ class TeachPanelApp:
         self._viewpoint_execute_busy = False
         # 一键采集独立门禁:不复用 _viewpoint_execute_busy(单点 Execute 的 done 会误恢复 UI)
         self._viewpoint_acquire_busy = False
+        # Read Detection 独立门禁：等待新检测结果的轮询期间禁止重复点击
+        self._viewpoint_detect_busy = False
         self.viewpoint_plan_data: dict | None = None
         self.viewpoint_acquire_button: ttk.Button | None = None
 
@@ -6990,13 +7036,141 @@ class TeachPanelApp:
         ).grid(row=2, column=3, sticky="w", padx=5, pady=4)
         ttk.Button(
             frame,
+            text="Read Detection",
+            command=self._use_latest_detection_from_tab,
+        ).grid(row=3, column=0, columnspan=1, sticky="ew", padx=5, pady=(4, 4))
+        ttk.Button(
+            frame,
             text="Plan",
             command=self._plan_viewpoint_from_tab,
             style="Primary.TButton",
-        ).grid(row=3, column=0, columnspan=4, sticky="ew", padx=5, pady=(4, 4))
+        ).grid(row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=(4, 4))
         ttk.Label(frame, textvariable=self.viewpoint_summary_var).grid(
             row=4, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 4)
         )
+
+    def _use_latest_detection_from_tab(self) -> None:
+        """Read Detection：触发一次重新检测，拿到新 base_grasp_xyz 后回填输入框。
+
+        worker 线程执行：记录基线序号 → 发布 restart_search 强制重搜 → 轮询等待
+        新结果；短时间内无结果且检测进程未运行则自动拉起 perception-only 检测
+        （复用 managed process 框架），继续等到总超时。UI 只经 root.after 更新。
+        """
+        node = self.node
+        if self._viewpoint_detect_busy:
+            return
+        self._viewpoint_detect_busy = True
+        self.viewpoint_summary_var.set("detecting ...")
+        node._write_event(
+            "viewpoint_detection_read",
+            "viewpoint read detection requested",
+        )
+        node._start_worker(self._detect_target_worker)
+
+    def _detect_target_worker(self) -> None:
+        node = self.node
+        with node.lock:
+            baseline_seq = node.detection_seq
+        # restart_search 无订阅者时发布无意义（检测链路未启动），短窗后走自动拉起
+        try:
+            node.detection_restart_pub.publish(Empty())
+        except Exception as exc:  # noqa: BLE001 - 面板回调兜底,不阻塞 UI
+            self.root.after(
+                0,
+                lambda message=str(exc): self._detection_read_failed(message),
+            )
+            return
+        restart_time = time.monotonic()
+        grace_sec = 3.0
+        started_process = False
+        timeout_sec = float(node.get_parameter("detection_read_timeout_sec").value)
+        deadline = time.monotonic() + timeout_sec
+        next_status = 0.0
+        while time.monotonic() < deadline:
+            with node.lock:
+                seq = node.detection_seq
+                xyz = node.latest_detection_xyz
+            if seq > baseline_seq and xyz is not None:
+                self.root.after(
+                    0,
+                    lambda target=tuple(xyz): self._detection_read_succeeded(target),
+                )
+                return
+            if (
+                not started_process
+                and time.monotonic() > restart_time + grace_sec
+            ):
+                running = False
+                with node.lock:
+                    process = node.managed_processes.get("detection_preview")
+                    running = process is not None and process.poll() is None
+                if not running:
+                    command = str(
+                        node.get_parameter("detection_preview_command").value
+                    ).strip()
+                    if command:
+                        node._status(
+                            f"detection preview not running; starting: {command}"
+                        )
+                        node._start_managed_process_worker(
+                            "detection_preview", skip_external_check=True
+                        )
+                        started_process = True
+            now = time.monotonic()
+            if now >= next_status:
+                elapsed = int(now - (deadline - timeout_sec))
+                self.root.after(
+                    0,
+                    lambda e=elapsed: self.viewpoint_summary_var.set(
+                        f"waiting for detection ... {e}s"
+                    ),
+                )
+                next_status = now + 5.0
+            time.sleep(0.25)
+        self.root.after(0, self._detection_read_timeout)
+
+    def _detection_read_succeeded(self, xyz: tuple[float, float, float]) -> None:
+        for axis, value in zip(("x", "y", "z"), xyz):
+            self.viewpoint_xyz_vars[axis].set(f"{value:.3f}")
+        self.node._viewpoint_plan_target_xyz = tuple(xyz)
+        self.node._write_event(
+            "viewpoint_detection_read",
+            "viewpoint read detection ok",
+            target_xyz=[float(value) for value in xyz],
+        )
+        self.viewpoint_summary_var.set(
+            f"detection target=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})"
+        )
+        self.node._status("read detection ok")
+        self._viewpoint_detect_busy = False
+
+    def _detection_read_failed(self, message: str) -> None:
+        self.node._write_event(
+            "viewpoint_detection_read",
+            "viewpoint read detection failed",
+            server_message=message,
+        )
+        self.viewpoint_summary_var.set("detection failed")
+        self.node._status(f"read detection failed: {message}", warn=True)
+        self._viewpoint_detect_busy = False
+
+    def _detection_read_timeout(self) -> None:
+        timeout_sec = float(
+            self.node.get_parameter("detection_read_timeout_sec").value
+        )
+        self.node._write_event(
+            "viewpoint_detection_read",
+            f"viewpoint read detection timeout after {timeout_sec:g}s",
+        )
+        self.viewpoint_summary_var.set(
+            f"detection timeout ({timeout_sec:g}s): no new target"
+        )
+        self.node._status(
+            "read detection timeout: no new detection; check camera / detection log "
+            "(<session>/detection_preview.log)",
+            warn=True,
+        )
+        self._viewpoint_detect_busy = False
 
     def _plan_viewpoint_from_tab(self) -> None:
         try:

@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Arachne Viewpoint MCP Integration Document",
+  "version": "2026-08-28",
+  "server_info": {
+    "name": "arachne-viewpoint-mcp",
+    "description": "Robot viewpoint planning and viewpoint-acquire capture chain exposure. Read-only planning is safe to hand to any agent; execution moves the real arm and must be restricted.",
+    "host_machine": "Jetson (robot side), LAN address e.g. 192.168.1.132",
+    "port": 8123,
+    "availability": "Opt-in. Started from teach_panel GUI button 'MCP Servers' or ros2 launch arachne_mcp mcp_servers.launch.py"
+  },
+  "security": {
+    "auth": "HTTP Authorization header: Bearer <token>",
+    "token_env_vars": {
+      "ARACHNE_MCP_PLANNER_TOKEN": "planner-only token, safe to distribute to agents",
+      "ARACHNE_MCP_EXECUTION_TOKEN": "execution token, RESTRICTED - can move the robot arm"
+    },
+    "motion_gate": {
+      "default": "closed",
+      "detail": "acquire_chain only moves the arm when both mcp_motion_enabled:=true AND mcp_confirm_agent_motion:=true are set on the launch command. Requires an explicit operator decision."
+    },
+    "rules": [
+      "Do not log or commit tokens.",
+      "Planner capability is read-only and never moves the arm.",
+      "Every acquire_chain call that actually runs implies arm motion between viewpoints.",
+      "Use cancel_acquire to stop an in-flight chain at any time.",
+      "GET /health is the ONLY token-free endpoint; it reports liveness only (see health_probe below) and never exposes capability, state or data."
+    ]
+  },
+  "health_probe": {
+    "path": "/health",
+    "methods": ["GET", "HEAD"],
+    "auth": "none",
+    "purpose": "Token-free liveness probe: answers whether the MCP listener is up. HTTP 200 with body {\"status\":\"ok\",\"service\":\"arachne_mcp\"} for the aggregate server (standalone debug servers report their own service names). Connection refused/timeout means the MCP process is not running. Placed outside the bearer guard; it carries no capability, no state and no data, so guarded paths and their auth are unaffected.",
+    "added": "2026-08-28"
+  },
+  "transports": {
+    "mcp_streamable_http": {
+      "description": "Model Context Protocol over Streamable HTTP (JSON-RPC). Use these URLs as-is when configuring an MCP client (Claude Desktop, opencode, custom agent).",
+      "endpoints": [
+        {
+          "name": "arachne-viewpoint-planner",
+          "url": "http://192.168.1.132:8123/arachne/viewpoint/plan",
+          "bearer_token_env_var": "ARACHNE_MCP_PLANNER_TOKEN",
+          "tools": ["plan_viewpoints", "list_reachable_viewpoints"]
+        },
+        {
+          "name": "arachne-viewpoint-acquire",
+          "url": "http://192.168.1.132:8123/arachne/viewpoint/acquire",
+          "bearer_token_env_var": "ARACHNE_MCP_EXECUTION_TOKEN",
+          "tools": ["acquire_chain", "get_acquire_status", "cancel_acquire"]
+        }
+      ],
+      "client_config_example": {
+        "mcpServers": {
+          "arachne-viewpoint-planner": {
+            "type": "http",
+            "url": "http://192.168.1.132:8123/arachne/viewpoint/plan",
+            "authorization": {
+              "type": "bearer",
+              "scheme": "bearer",
+              "credentials": "REPLACE_WITH_ARACHNE_MCP_PLANNER_TOKEN"
+            }
+          },
+          "arachne-viewpoint-acquire": {
+            "type": "http",
+            "url": "http://192.168.1.132:8123/arachne/viewpoint/acquire",
+            "authorization": {
+              "type": "bearer",
+              "scheme": "bearer",
+              "credentials": "REPLACE_WITH_ARACHNE_MCP_EXECUTION_TOKEN"
+            }
+          }
+        }
+      }
+    },
+    "plain_json_http": {
+      "description": "Same five capabilities exposed as plain JSON endpoints for agents without MCP support. Request body = tool argument object; response body = {'ok': true|false, 'result': <tool output> | 'error': '<reason>'}. Same bearer-token split as the MCP paths.",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/arachne/json/viewpoint/plan/plan_viewpoints",
+          "tool": "plan_viewpoints",
+          "bearer_token_env_var": "ARACHNE_MCP_PLANNER_TOKEN"
+        },
+        {
+          "method": "POST",
+          "path": "/arachne/json/viewpoint/plan/list_reachable_viewpoints",
+          "tool": "list_reachable_viewpoints",
+          "bearer_token_env_var": "ARACHNE_MCP_PLANNER_TOKEN"
+        },
+        {
+          "method": "POST",
+          "path": "/arachne/json/viewpoint/acquire/acquire_chain",
+          "tool": "acquire_chain",
+          "bearer_token_env_var": "ARACHNE_MCP_EXECUTION_TOKEN"
+        },
+        {
+          "method": "GET",
+          "path": "/arachne/json/viewpoint/acquire/status",
+          "tool": "get_acquire_status",
+          "bearer_token_env_var": "ARACHNE_MCP_EXECUTION_TOKEN"
+        },
+        {
+          "method": "POST",
+          "path": "/arachne/json/viewpoint/acquire/cancel",
+          "tool": "cancel_acquire",
+          "bearer_token_env_var": "ARACHNE_MCP_EXECUTION_TOKEN"
+        }
+      ],
+      "http_status_semantics": {
+        "200": "ok==true, result holds tool output",
+        "400": "bad arguments or malformed JSON body",
+        "401": "missing/wrong bearer token",
+        "403/503": "request rejected (e.g. motion gate closed)",
+        "404": "unknown path or plan_id not found",
+        "405": "wrong HTTP method"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "plan_viewpoints",
+      "capability": "planner",
+      "danger": "read_only",
+      "summary": "Sample candidate viewpoints around a target position and persist the filtered result to the shared plan directory. Never moves anything.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["target_xyz"],
+        "properties": {
+          "target_xyz": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Target position in base_link frame [x, y, z] meters."
+          },
+          "strategy": {"type": "string", "default": "fibonacci_sphere"},
+          "radius_m": {"type": "number", "default": 0.5},
+          "num_viewpoints": {"type": "integer", "minimum": 1, "maximum": 128, "default": 32},
+          "filter_ik_reachable": {"type": "boolean", "default": true},
+          "filter_collision_free": {"type": "boolean", "default": true},
+          "up_vector": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "nullable": true,
+            "default": null,
+            "description": "Sampling-sphere reference axis in base_link frame (default [0,0,1])."
+          }
+        }
+      },
+      "output_summary": {
+        "plan_id": "id string, required by list_reachable_viewpoints / acquire_chain",
+        "plan_file": "absolute path of the persisted plan file",
+        "num_viewpoints": "total sampled count",
+        "reachable_count": "count passing ik && collision filters",
+        "viewpoints": [
+          {
+            "camera_xyz_base": "[x,y,z] of camera origin",
+            "tool0_xyz_base": "[x,y,z] of flange",
+            "ik_reachable": true,
+            "collision_free": true,
+            "ik_joints": "per-joint values"
+          }
+        ]
+      },
+      "example_request_arguments": {
+        "target_xyz": [0.3, 0.0, 0.2],
+        "radius_m": 0.5,
+        "num_viewpoints": 32,
+        "filter_ik_reachable": true,
+        "filter_collision_free": true
+      }
+    },
+    {
+      "name": "list_reachable_viewpoints",
+      "capability": "planner",
+      "danger": "read_only",
+      "summary": "Return only the ik-reachable && collision-free viewpoints of a stored plan, indexed for use by acquire_chain.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["plan_id"],
+        "properties": {
+          "plan_id": {"type": "string", "description": "id returned by plan_viewpoints."}
+        }
+      },
+      "output_summary": {
+        "plan_id": "echoed id",
+        "plan_file": "absolute path",
+        "total_viewpoints": "total sampled count",
+        "reachable_count": "filtered count",
+        "reachable_viewpoints": [
+          {
+            "index": "position inside the filtered list - pass this to acquire_chain indices",
+            "tool0_xyz_base": "[x,y,z]",
+            "camera_xyz_base": "[x,y,z]",
+            "ik_joints_deg": "joint solution in degrees",
+            "collision_clearance_m": "collision clearance in meters"
+          }
+        ]
+      },
+      "example_request_arguments": {"plan_id": "<from plan_viewpoints>"}
+    },
+    {
+      "name": "acquire_chain",
+      "capability": "execution",
+      "danger": "motion",
+      "summary": "Asynchronously move the arm through selected viewpoints of a stored plan and capture RGB/depth/cloud at each. Returns immediately; poll get_acquire_status.",
+      "preconditions": "launch flags mcp_motion_enabled:=true and mcp_confirm_agent_motion:=true must be set; otherwise rejected and nothing moves",
+      "inputSchema": {
+        "type": "object",
+        "required": ["plan_id"],
+        "properties": {
+          "plan_id": {"type": "string", "description": "id returned by plan_viewpoints."},
+          "indices": {
+            "anyOf": [{"enum": ["all"]}, {"type": "array", "items": {"type": "integer"}}],
+            "default": "all",
+            "description": "'all' or positions inside the FILTERED reachable list returned by list_reachable_viewpoints."
+          }
+        }
+      },
+      "output_summary": {
+        "success": "true means accepted and running asynchronously; false means rejected (gate/busy/bad plan/max points) with 'message' explaining why",
+        "run_id": "batch id used to correlate status results",
+        "run_dir": "absolute output directory containing manifest.json and per-index captures",
+        "num_viewpoints": "number of points in this run",
+        "note": "poll get_acquire_status until busy=false"
+      },
+      "example_request_arguments": {"plan_id": "<from plan_viewpoints>", "indices": "all"}
+    },
+    {
+      "name": "get_acquire_status",
+      "capability": "execution",
+      "danger": "read_only",
+      "summary": "Poll the running or last acquire chain. Call after every acquire_chain until busy=false.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "output_summary": {
+        "busy": "chain still running",
+        "completed": "points finished so far",
+        "current_index": "index currently being processed",
+        "points": [
+          {"index": 0, "ok": true, "path": "absolute capture dir", "errors": null, "cloud_point_count": 12345}
+        ],
+        "cancelled": false,
+        "error": "null unless the worker crashed",
+        "started_stamp": "ISO timestamp",
+        "finished_stamp": "ISO timestamp or null while running"
+      },
+      "example_request_arguments": {}
+    },
+    {
+      "name": "cancel_acquire",
+      "capability": "execution",
+      "danger": "stop",
+      "summary": "Safely stop a running chain: interrupts in-flight motion (SDK stopJoint + zero velocity stream) and finalizes the manifest. Safe to call any time.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "output_summary": {
+        "success": "false if no active chain existed",
+        "cancelled": true,
+        "points_completed": "count captured before cancellation",
+        "message": "human-readable outcome"
+      },
+      "example_request_arguments": {}
+    }
+  ],
+  "recommended_agent_flow": [
+    "1. call plan_viewpoints(target_xyz=...) -> plan_id",
+    "2. call list_reachable_viewpoints(plan_id) -> inspect reachable_viewpoints[].index",
+    "3. if motion is authorized: call acquire_chain(plan_id, indices=[...]) -> run_id",
+    "4. poll get_acquire_status() until busy=false -> per-point ok/path results",
+    "5. optionally cancel_acquire() to abort early or release a stuck chain"
+  ]
+}

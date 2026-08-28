@@ -1,0 +1,47 @@
+# Arachne project ruff config.
+#
+# Mirrors the pi-lens bundled core.toml (select + ignore) so lint behavior for
+# the rest of the workspace is unchanged, and freezes pre-existing lint debt in
+# legacy files via [lint.per-file-ignores] so edits to them stay reviewable.
+# When a project-level config exists, pi-lens uses it instead of its bundled
+# core.toml (see pi-lens dist/clients/ruff-client.js: ruffConfigArgs).
+
+line-length = 88
+
+[lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes (undefined names, unused imports)
+  "I",    # isort (import ordering)
+  "B",    # flake8-bugbear (likely bugs and design issues)
+  "UP",   # pyupgrade (modernize syntax for target Python version)
+  "SIM",  # flake8-simplify (simplifiable constructs)
+  "C4",   # flake8-comprehensions (unnecessary comprehension patterns)
+  "PIE",  # flake8-pie (misc lints)
+  "S",    # flake8-bandit (security checks)
+]
+ignore = [
+  "E501",   # line too long — formatter handles this
+  "B008",   # function call in default argument — common FastAPI/typer pattern
+  "SIM108", # ternary operator — readability is subjective
+  "S101",   # bare assert — idiomatic in app/test code
+  "S311",   # non-cryptographic random — non-security uses (jitter, filenames)
+  "S603",   # subprocess without shell=True — list-arg form is the safe form
+  "S607",   # subprocess with PATH lookup — standard CLI-wrapping practice
+]
+
+[lint.per-file-ignores]
+# Legacy operator panel: 44 pre-existing findings (B905/SIM105/S110/UP031/
+# S108/F841/C408/B007) predate lint adoption; frozen so edits stay reviewable.
+"src/arachne_operator/arachne_operator/teach_panel.py" = [
+  "B905", "SIM105", "S110", "UP031", "S108", "F841", "C408", "B007",
+]
+# arachne_mcp: the MCP endpoints deliberately default to bind 0.0.0.0 so the
+# remote agent can reach them over the LAN (mcp_exposure_todo_plan.md §2.2;
+# bind_host parameter narrows to 127.0.0.1; endpoints are opt-in + bearer-token
+# gated, execution motion gate defaults closed). S108: teach-gate/control-owner
+# paths are deliberate fixed /tmp files, same defaults as teach_panel.launch.py.
+"src/arachne_mcp/**" = ["S104", "S108"]
+# teach_panel.launch.py carries the same deliberate /tmp teach-gate paths.
+"src/arachne_operator/launch/*.launch.py" = ["S108"]

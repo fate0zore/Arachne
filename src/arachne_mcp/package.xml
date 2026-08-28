@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>arachne_mcp</name>
+  <version>0.1.0</version>
+  <description>MCP (Model Context Protocol) exposure for Arachne viewpoint planning and viewpoint-acquire execution chain.</description>
+  <maintainer email="maintainer@example.com">Arachne Maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>arachne_operator</exec_depend>
+  <exec_depend>viewpoint_planner_msgs</exec_depend>
+  <exec_depend>python3-mcp</exec_depend>
+  <exec_depend>python3-uvicorn</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

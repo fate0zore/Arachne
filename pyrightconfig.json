@@ -1,0 +1,14 @@
+{
+  "include": ["src"],
+  "exclude": ["build", "install", "log", "recordings", "**/__pycache__"],
+  "extraPaths": [
+    "src",
+    "/opt/ros/humble/lib/python3.10/site-packages",
+    "/opt/ros/humble/local/lib/python3.10/dist-packages",
+    "/home/jetson/.local/lib/python3.10/site-packages",
+    "/usr/lib/python3/dist-packages",
+    "/usr/local/lib/python3.10/dist-packages"
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic"
+}
