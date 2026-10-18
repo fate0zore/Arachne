@@ -143,6 +143,21 @@ tmp/
 temp/
 cache/
 
+# Local agent/tooling scratch and debug leftovers (stay local, not in the repo).
+.VSCodeCounter/
+.pi/
+.reasonix/
+reasonix.toml
+Log/
+persist_test_ws.txt
+*.bak
+
+# Ad-hoc teach recordings: keep only curated JSON; duplicates and probe files
+# (name *copy*.json, *_test.json, step1.json) stay local.
+recordings/teach/*copy*.json
+recordings/teach/*_test.json
+recordings/teach/step1.json
+
 # Local YOLO/TensorRT artifacts can be large and machine-specific.
 yolo_workspace/runs/
 yolo_workspace/cache/
