@@ -7096,10 +7096,7 @@ class TeachPanelApp:
                     lambda target=tuple(xyz): self._detection_read_succeeded(target),
                 )
                 return
-            if (
-                not started_process
-                and time.monotonic() > restart_time + grace_sec
-            ):
+            if not started_process and time.monotonic() > restart_time + grace_sec:
                 running = False
                 with node.lock:
                     process = node.managed_processes.get("detection_preview")
@@ -7155,9 +7152,7 @@ class TeachPanelApp:
         self._viewpoint_detect_busy = False
 
     def _detection_read_timeout(self) -> None:
-        timeout_sec = float(
-            self.node.get_parameter("detection_read_timeout_sec").value
-        )
+        timeout_sec = float(self.node.get_parameter("detection_read_timeout_sec").value)
         self.node._write_event(
             "viewpoint_detection_read",
             f"viewpoint read detection timeout after {timeout_sec:g}s",
